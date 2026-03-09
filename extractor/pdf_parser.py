@@ -386,10 +386,14 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         return ""
 
     date = get("date")
+    # Normalize whitespace around date separators (pdfplumber wraps wide-table cells)
+    # e.g. "27-Sep- 2025" → "27-Sep-2025", "15-Oct- 2025" → "15-Oct-2025"
+    date = re.sub(r"\s*([/\-.])\s*", r"\1", date)
+    date = re.sub(r"\s+", " ", date).strip()
     if not date or not any(p.search(date) for p in DATE_PATTERNS):
         return None
 
-    description = get("description")
+    description = re.sub(r"\s+", " ", get("description")).strip()
 
     # Skip summary/total rows that happen to contain a date
     row_text = " ".join(row).lower()
@@ -735,20 +739,39 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     Uses prev_balance (if available) to determine debit vs credit:
     balance increased → credit, balance decreased → debit.
     """
-    if not DATE_START_RE.match(line):
-        return None
-
+    # Try date at start of line first
     date_match = None
-    for pattern in DATE_PATTERNS:
-        date_match = pattern.match(line)
-        if date_match:
-            break
+    rest_start = 0
+    if DATE_START_RE.match(line):
+        for pattern in DATE_PATTERNS:
+            date_match = pattern.match(line)
+            if date_match:
+                break
+
+    # Fallback: date after a serial number prefix (e.g. "1 17-Sep-2025 ...")
+    if not date_match:
+        sr_prefix = re.match(r"^\d{1,4}\s+", line)
+        if sr_prefix:
+            after_sr = line[sr_prefix.end():]
+            if DATE_START_RE.match(after_sr):
+                for pattern in DATE_PATTERNS:
+                    date_match = pattern.match(after_sr)
+                    if date_match:
+                        rest_start = sr_prefix.end()
+                        break
 
     if not date_match:
         return None
 
     date = date_match.group(1)
-    rest = line[date_match.end():].strip()
+    rest = line[rest_start + date_match.end():].strip()
+
+    # Strip a second date (Value Date) if it appears right after the transaction date
+    for pattern in DATE_PATTERNS:
+        m2 = pattern.match(rest)
+        if m2:
+            rest = rest[m2.end():].strip()
+            break
 
     # Skip summary/total lines
     line_lower = line.lower()

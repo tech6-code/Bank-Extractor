@@ -14,6 +14,8 @@ from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("extractor.pdf_parser").setLevel(logging.DEBUG)
+logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Bank Statement Converter API")
