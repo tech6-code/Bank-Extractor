@@ -11,7 +11,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 
 const ROWS_PER_PAGE = 25;
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 interface Transaction {
   date: string;

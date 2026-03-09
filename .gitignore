@@ -46,4 +46,6 @@ Desktop.ini
 
 # Environment
 .env
-.env.*
+.env.local
+.env.*.local
+!.env.example
