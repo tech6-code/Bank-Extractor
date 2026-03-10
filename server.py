@@ -32,6 +32,9 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["Date", "Description", "Debit", "Credit", "Balance"]
 
+# In-memory cache: file_id -> extracted transactions
+_cache: dict[str, list[dict]] = {}
+
 
 @app.post("/api/extract")
 async def extract_preview(file: UploadFile):
@@ -57,6 +60,8 @@ async def extract_preview(file: UploadFile):
     if not transactions:
         pdf_path.unlink(missing_ok=True)
         raise HTTPException(422, "No transaction data found in the PDF. The parser could not detect structured tables or date-prefixed transaction lines.")
+
+    _cache[file_id] = transactions
 
     return {
         "file_id": file_id,
@@ -122,25 +127,26 @@ async def debug_pdf(file: UploadFile):
 @app.post("/api/download/{file_id}")
 async def download_excel(file_id: str):
     """Convert a previously uploaded PDF to Excel and return the file."""
-    pdf_path = TEMP_DIR / f"{file_id}.pdf"
-    if not pdf_path.exists():
-        raise HTTPException(404, "File not found. Please re-upload.")
-
     xlsx_path = TEMP_DIR / f"{file_id}.xlsx"
 
     try:
-        transactions = extract_transactions(str(pdf_path))
+        transactions = _cache.get(file_id)
+        if transactions is None:
+            # Cache miss (e.g. server restarted) — re-extract from the saved PDF
+            pdf_path = TEMP_DIR / f"{file_id}.pdf"
+            if not pdf_path.exists():
+                raise HTTPException(404, "File not found. Please re-upload.")
+            transactions = extract_transactions(str(pdf_path))
+            _cache[file_id] = transactions
+
         # Build a single table: header row + data rows
-        table = [COLUMNS]
-        for txn in transactions:
-            table.append([
-                txn["date"],
-                txn["description"],
-                txn["debit"],
-                txn["credit"],
-                txn["balance"],
-            ])
+        table = [COLUMNS] + [
+            [txn["date"], txn["description"], txn["debit"], txn["credit"], txn["balance"]]
+            for txn in transactions
+        ]
         write_tables_to_excel([table], str(xlsx_path))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"Failed to generate Excel: {e}")
 

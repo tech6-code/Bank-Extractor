@@ -6,27 +6,150 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Flexible date patterns (support 1-2 digit day/month)
+# ── Date Patterns ─────────────────────────────────────────────────────────────
+# Full month names and common abbreviations
+_MONTH = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?"
+    r"|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+
 DATE_PATTERNS = [
+    # DD/MM/YYYY or MM/DD/YYYY  (4-digit year, /, -, . separator)
     re.compile(r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})\b"),
+    # YYYY/MM/DD or YYYY-MM-DD  (ISO-style)
     re.compile(r"\b(\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2})\b"),
-    re.compile(r"\b(\d{1,2}\s+\w{3}\s+\d{4})\b"),
-    re.compile(r"\b(\d{1,2}[/\-.]\w{3}[/\-.]\d{4})\b"),  # D-Mon-YYYY e.g. 4/Nov/2025
+    # DD/MM/YY or MM/DD/YY      (2-digit year)
+    re.compile(r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2})\b"),
+    # D Mon YYYY / D Month YYYY  e.g. "1 Jan 2024", "15 January 2024"
+    re.compile(rf"\b(\d{{1,2}}\s+{_MONTH}\s+\d{{4}})\b", re.IGNORECASE),
+    # D-Mon-YYYY / D/Mon/YYYY    e.g. "4-Nov-2025", "4/Nov/2025"
+    re.compile(rf"\b(\d{{1,2}}[/\-.]{_MONTH}[/\-.]\d{{4}})\b", re.IGNORECASE),
+    # Mon DD, YYYY / Mon DD YYYY (US-style) e.g. "Jan 15, 2024"
+    re.compile(rf"\b({_MONTH}\.?\s+\d{{1,2}},?\s+\d{{4}})\b", re.IGNORECASE),
+    # Mon-DD-YYYY / Mon/DD/YYYY  (US-style with separator)
+    re.compile(rf"\b({_MONTH}[/\-.]\d{{1,2}}[/\-.]\d{{4}})\b", re.IGNORECASE),
+    # D Month YYYY               e.g. "15 January 2024" (also caught above, kept for clarity)
+    re.compile(rf"\b(\d{{1,2}}\s+{_MONTH}\s+\d{{2,4}})\b", re.IGNORECASE),
 ]
-DATE_START_RE = re.compile(r"^\d{1,2}[/\-.](\d{1,2}|\w{3})[/\-.]\d{4}")
+
+DATE_START_RE = re.compile(
+    rf"^\d{{1,2}}[/\-.](\d{{1,2}}|{_MONTH})[/\-.]\d{{2,4}}"
+    rf"|^\d{{4}}[/\-.]\d{{1,2}}[/\-.]\d{{1,2}}"
+    rf"|^\d{{1,2}}\s+{_MONTH}\s+\d{{2,4}}"
+    rf"|^{_MONTH}",
+    re.IGNORECASE,
+)
+
 AMOUNT_RE = re.compile(r"-?[\d,]+\.\d{2}")
 SIGNED_AMOUNT_RE = re.compile(r"[+\-]?[\d,]+\.\d{2}")
 FLEX_AMOUNT_RE = re.compile(r"-?[\d,]+(?:\.\d{1,2})?$")
 # For finding amounts in text lines (must be whitespace-bounded)
 TEXT_AMOUNT_RE = re.compile(r"(?:^|\s)(-?[\d,]+(?:\.\d{1,2})?)(?=\s|$)")
 
-# Header keywords
-DATE_KEYWORDS = {"date", "txn date", "transaction date", "value date", "posting date", "trans date"}
-DESC_KEYWORDS = {"description", "particulars", "narration", "details", "transaction details", "remarks"}
-DEBIT_KEYWORDS = {"debit", "withdrawal", "withdrawals", "dr", "debit amount", "dr amount", "paid out"}
-CREDIT_KEYWORDS = {"credit", "deposit", "deposits", "cr", "credit amount", "cr amount", "paid in"}
-BALANCE_KEYWORDS = {"balance", "closing balance", "running balance", "available balance"}
-AMOUNT_KEYWORDS = {"amount", "transaction amount", "txn amount"}
+# ── Universal Column Keyword Sets ─────────────────────────────────────────────
+# Covers major banks: US, UK, India, Middle East, Southeast Asia, Africa, etc.
+
+DATE_KEYWORDS = {
+    "date", "dt",
+    # Transaction date variants
+    "transaction date", "txn date", "tran date", "trans date", "trans. date",
+    "txn dt", "tran dt", "trans dt", "transaction dt",
+    # Posting / value date variants
+    "posting date", "post date", "posted date", "post dt",
+    "value date", "val date", "val. date", "value dt",
+    "entry date", "effective date", "effective dt",
+    "trade date", "settlement date", "settlement dt",
+    "process date", "processed date", "processing date",
+    "book date", "booking date", "clearing date",
+    # Short abbreviations used by specific banks
+    "vd", "pd", "txdt", "trdt",
+}
+
+DESC_KEYWORDS = {
+    "description", "desc",
+    "particulars", "particular",
+    "narration", "narrative",
+    "details", "detail",
+    "remarks", "remark",
+    "memo", "note", "notes",
+    # Compound names
+    "transaction details", "transaction description",
+    "txn description", "txn details",
+    "payment details", "payment description",
+    "cheque details", "check details", "chq details",
+    # Payee / beneficiary
+    "payee", "beneficiary", "beneficiary name",
+    "merchant", "merchant name", "counterparty",
+    # Other region-specific names
+    "reference description", "ref description",
+    "chalan description", "instrument description",
+}
+
+DEBIT_KEYWORDS = {
+    "debit", "dr", "dr.",
+    "debit amount", "dr amount", "dr. amount", "debit amt", "dr amt",
+    # Withdrawal variants
+    "withdrawal", "withdrawals", "withdrawal amount",
+    "withdraw", "wdl", "wdrawal",
+    # Payment / outflow
+    "paid out", "money out", "outflow",
+    "payment", "payments",
+    "charge", "charges",
+    "spent", "deductions",
+    "disbursement", "disbursements",
+}
+
+CREDIT_KEYWORDS = {
+    "credit", "cr", "cr.",
+    "credit amount", "cr amount", "cr. amount", "credit amt", "cr amt",
+    # Deposit variants
+    "deposit", "deposits", "deposit amount",
+    # Receipt / inflow
+    "paid in", "money in", "inflow",
+    "receipt", "receipts",
+    "received", "income",
+    "collection", "collections",
+}
+
+BALANCE_KEYWORDS = {
+    "balance", "bal", "bal.",
+    "closing balance", "opening balance",
+    "running balance", "current balance",
+    "available balance", "avail balance",
+    "ledger balance", "book balance",
+    "outstanding balance",
+    "end balance", "ending balance",
+    "net balance", "total balance",
+    "o/b", "c/b",
+}
+
+AMOUNT_KEYWORDS = {
+    "amount", "amt",
+    "transaction amount", "txn amount", "tran amount", "trans amount",
+    "net amount", "net amt",
+    "local amount", "foreign amount",
+    # Combined Dr/Cr column (signed single amount column)
+    "dr/cr", "cr/dr", "dr / cr", "cr / dr",
+}
+
+# Columns to skip — reference numbers, cheque nos, etc. are not transaction data
+SKIP_COL_KEYWORDS = {
+    "reference", "ref", "ref.", "ref no", "ref no.", "reference no",
+    "reference no.", "reference number", "ref number",
+    "cheque", "cheque no", "cheque no.", "cheque number",
+    "check", "check no", "check no.", "check number",
+    "chq", "chq no", "chq no.", "chq number",
+    "serial", "serial no", "serial no.", "sr no", "sr. no", "s.no", "s/no", "s no", "s no.",
+    "voucher", "voucher no", "voucher no.", "voucher number",
+    "instrument no", "instrument number",
+    "sequence", "seq", "seq no", "seq no.",
+    "tran id", "transaction id", "txn id", "trans id",
+    "no.", "no", "#",
+    "branch", "branch code", "branch name",
+    "channel", "type", "trans type", "transaction type",
+    "currency", "ccy", "cur",
+    "mode",
+}
 
 # Rows containing these phrases (case-insensitive) are not real transactions
 SKIP_PHRASES = [
@@ -34,7 +157,270 @@ SKIP_PHRASES = [
     "opening balance", "closing balance", "balance brought", "balance carried",
     "statement summary", "account summary", "end of statement",
     "balance b/f", "balance c/f", "brought forward", "carried forward",
+    # Page header / account info markers
+    "summary of accounts", "summary of savings",
+    "please review this account statement",
+    "account statement from",
+    "account type", "account holder",
+    "if no issues are reported",
 ]
+
+# Regex to detect IBAN numbers in description text (clear sign of a header dump)
+_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{15,}\b")
+
+# Description starts with these → the entire row is a page header, not a transaction
+_DESC_HEADER_RES = [
+    re.compile(r"^account statement\b", re.IGNORECASE),
+    re.compile(r"^your bank statement\b", re.IGNORECASE),
+    re.compile(r"^statement of account\b", re.IGNORECASE),
+    re.compile(r"^account summary\b", re.IGNORECASE),
+    re.compile(r"^summary of account", re.IGNORECASE),
+]
+
+# When these phrases appear INSIDE a description, everything from that point onward
+# is footer/contact info that was merged into the description — truncate there.
+_DESC_FOOTER_MARKERS = [
+    "for assistance", "for help,", "for help ", "contact us",
+    "customer service", "please call", "helpline", "toll free",
+    "call center", "call centre", "if you have any", "should you have any",
+    "for queries", "for complaints", "for any query",
+    "this is a digital stamp", "standard terms", "terms and conditions",
+    "does not require signature", "wio bank pjsc", "po box",
+]
+
+# Regex: truncate at © symbol or start of Arabic/RTL block mid-description
+_DESC_POISON_RE = re.compile(
+    r"©|\(c\)\s*\d{4}"                  # copyright mark
+    r"|[\u0600-\u06FF\u0750-\u077F]"    # Arabic / Farsi / Urdu characters
+    r"|\bpo\s+box\b",                    # mailing address
+    re.IGNORECASE,
+)
+# Strip trailing phone-number sequences from descriptions
+_TRAILING_PHONE_RE = re.compile(r"\s+\d[\d\s\-]{5,}\d\s*$")
+
+# Column roles that, when appearing consecutively inside a description, indicate
+# that the next page's column header row was merged in.
+_COL_HEADER_ROLES = frozenset({
+    "date", "description", "debit", "credit", "balance", "amount", "skip",
+})
+
+
+def _clean_description(description: str) -> str:
+    """Strip footer/metadata content merged into a transaction description.
+
+    Handles four cases:
+      1. Known text markers ("for assistance", "contact us", etc.)
+      2. Arabic characters or © copyright symbol appearing mid-text
+      3. Trailing phone-number sequences
+      4. Next-page column headers merged in (e.g. "... Amount Balance Date Ref. Number")
+    """
+    if not description:
+        return description
+
+    # 1. Truncate at known footer text markers
+    desc_lower = description.lower()
+    for marker in _DESC_FOOTER_MARKERS:
+        idx = desc_lower.find(marker)
+        if idx > 10:
+            description = description[:idx].strip()
+            desc_lower = description.lower()
+            break
+
+    # 2. Truncate at © or first Arabic character (clearly non-transaction content)
+    m = _DESC_POISON_RE.search(description)
+    if m and m.start() > 10:
+        description = description[:m.start()].strip()
+
+    # 3. Strip trailing phone-number-like digit sequences
+    description = _TRAILING_PHONE_RE.sub("", description).strip()
+
+    # 4. Detect consecutive column-header words merged into description.
+    #    e.g. "Owais Arshad Khan Amount Balance Date Ref. Number Description..."
+    #    Three or more consecutive words that all classify as column headers → truncate.
+    words = description.split()
+    run_start: int | None = None
+    run_len = 0
+    for i, word in enumerate(words):
+        # Strip punctuation/brackets but keep dots (for "Ref.")
+        clean_word = re.sub(r"[^A-Za-z0-9.]", "", word)
+        role, conf = classify_column_header(clean_word)
+        if conf >= 0.80 and role in _COL_HEADER_ROLES:
+            if run_start is None:
+                run_start = i
+            run_len += 1
+            # Require at least 3 consecutive header words AND real content before them
+            if run_len >= 3 and run_start > 0:
+                description = " ".join(words[:run_start]).strip()
+                break
+        else:
+            run_start = None
+            run_len = 0
+
+    return description
+
+
+def classify_column_header(header: str) -> tuple[str, float]:
+    """Classify a column header string into a canonical role.
+
+    Returns (role, confidence) where role is one of:
+      "date" | "description" | "debit" | "credit" | "balance" | "amount" | "skip" | "unknown"
+    and confidence is 0.0–1.0.
+
+    Strategy (highest wins):
+      1. Exact match in keyword set       → 1.0
+      2. Substring / containment match    → 0.85
+      3. Partial word match               → 0.70
+    Skip columns are detected first to avoid false positives.
+    """
+    if not header:
+        return "unknown", 0.0
+
+    # Normalise: strip non-ASCII (bilingual PDFs), collapse whitespace, lowercase
+    h = re.sub(r"[^\x00-\x7F]", "", header)
+    h = re.sub(r"[*#()\[\]]", "", h)
+    h = re.sub(r"\s+", " ", h).strip().lower()
+    if not h:
+        return "unknown", 0.0
+
+    # ── 1. SKIP columns (highest priority) ──────────────────────────────────
+    if h in SKIP_COL_KEYWORDS:
+        return "skip", 1.0
+
+    # Normalise dots-as-separators for abbreviations like "Ref. Number" → "ref number",
+    # "S.No." → "s no", "Chq.No" → "chq no"
+    h_nodot = re.sub(r"\.\s*", " ", h).strip()
+    h_nodot = re.sub(r"\s+", " ", h_nodot)
+    if h_nodot in SKIP_COL_KEYWORDS:
+        return "skip", 1.0
+
+    # Starts-with check: "Ref. Number Description" still starts with a skip keyword,
+    # so the whole phrase is skip (multi-word cross-column false match guard).
+    # Narrow exception: only "reference description" / "ref description" (exact) are
+    # valid description column headers — NOT "ref number description" or similar.
+    _skip_desc_exceptions = {"reference description", "ref description"}
+    if h not in _skip_desc_exceptions and h_nodot not in _skip_desc_exceptions:
+        _skip_lead = sorted(SKIP_COL_KEYWORDS, key=len, reverse=True)  # longest first
+        for _sk in _skip_lead:
+            if h.startswith(_sk + " ") or h_nodot.startswith(_sk + " "):
+                return "skip", 0.95
+
+    _skip_substrings = ("cheque no", "check no", "chq no", "ref no", "ref. no",
+                        "voucher no", "serial no", "tran id", "txn id", "trans id",
+                        "instrument no")
+    if any(sub in h for sub in _skip_substrings) or any(sub in h_nodot for sub in _skip_substrings):
+        # Don't skip if it also meaningfully identifies a real column
+        if not any(sub in h for sub in ("description", "narration", "particular", "detail")):
+            return "skip", 0.9
+
+    scores: dict[str, float] = {}
+
+    def _score(role: str, kw_set: set, substrings: tuple) -> None:
+        if h in kw_set:
+            scores[role] = max(scores.get(role, 0.0), 1.0)
+        elif any(sub in h for sub in substrings):
+            scores[role] = max(scores.get(role, 0.0), 0.85)
+
+    # ── 2. Date ──────────────────────────────────────────────────────────────
+    _score("date", DATE_KEYWORDS,
+           ("date", " dt", "dated"))
+    # bare "dt" only when it IS the whole header
+    if h == "dt":
+        scores["date"] = max(scores.get("date", 0.0), 0.80)
+
+    # ── 3. Description ───────────────────────────────────────────────────────
+    _score("description", DESC_KEYWORDS,
+           ("description", "narration", "particular", "detail", "remark",
+            "memo", "narrative", "beneficiar", "payee", "merchant"))
+
+    # ── 4. Debit ─────────────────────────────────────────────────────────────
+    _score("debit", DEBIT_KEYWORDS,
+           ("debit", "withdrawal", "paid out", "money out", "outflow",
+            "payment", "charge", "disbursement", "wdl"))
+    if h in ("dr", "dr."):
+        scores["debit"] = max(scores.get("debit", 0.0), 0.95)
+
+    # ── 5. Credit ────────────────────────────────────────────────────────────
+    _score("credit", CREDIT_KEYWORDS,
+           ("credit", "deposit", "paid in", "money in", "inflow",
+            "receipt", "collection"))
+    if h in ("cr", "cr."):
+        scores["credit"] = max(scores.get("credit", 0.0), 0.95)
+
+    # ── 6. Balance ───────────────────────────────────────────────────────────
+    _score("balance", BALANCE_KEYWORDS,
+           ("balance", "bal."))
+    # bare "bal" only when it IS the whole header (avoid "global", etc.)
+    if h in ("bal", "bal."):
+        scores["balance"] = max(scores.get("balance", 0.0), 0.90)
+
+    # ── 7. Amount (combined/signed single column) ────────────────────────────
+    _score("amount", AMOUNT_KEYWORDS,
+           ("amount", " amt", "dr/cr", "cr/dr"))
+    if h in ("dr/cr", "cr/dr", "dr / cr", "cr / dr"):
+        scores["amount"] = max(scores.get("amount", 0.0), 0.95)
+
+    if not scores:
+        return "unknown", 0.0
+
+    best_role = max(scores, key=lambda r: scores[r])
+    return best_role, scores[best_role]
+
+
+def _score_header_line(sorted_words: list[dict]) -> tuple[int, list[tuple[str, float]]]:
+    """Score a line of sorted (by x) words for column header matches.
+
+    Tries 3-word → 2-word → 1-word phrase combinations so that multi-word
+    headers like "Transaction Date" or "Paid Out" are matched as a unit.
+
+    IMPORTANT: If the current word alone is a strong skip (e.g. "Ref.", "Cheque"),
+    we record it as skip immediately WITHOUT extending to longer phrases.  This
+    prevents cross-column combinations like "Ref. Number Description" from being
+    misclassified as a description column.
+
+    Returns:
+        score     — number of meaningful (non-skip/unknown) roles found
+        col_roles — list of (role, x0) for every matched phrase
+    """
+    col_roles: list[tuple[str, float]] = []
+    score = 0
+    i = 0
+    while i < len(sorted_words):
+        # ── Early-exit for strong single-word skip tokens ─────────────────
+        # e.g. "Ref.", "Cheque", "Serial" — do NOT try to extend these into
+        # longer phrases that would span the next column's header words.
+        single_role, single_conf = classify_column_header(sorted_words[i]["text"])
+        if single_role == "skip" and single_conf >= 0.90:
+            col_roles.append(("skip", sorted_words[i]["x0"]))
+            i += 1
+            continue
+
+        # Try 2-word combination ONLY when the current word alone is weak.
+        # 3-word phrases are intentionally avoided — they easily span column boundaries
+        # (e.g. "Number Description Amount" would consume three separate columns).
+        matched = False
+        if i + 1 < len(sorted_words):
+            next_role, next_conf = classify_column_header(sorted_words[i + 1]["text"])
+            # Only combine when the next word is also individually weak (not a strong
+            # standalone header word) AND is not a skip boundary.
+            if next_conf < 0.70 and next_role != "skip":
+                phrase = sorted_words[i]["text"] + " " + sorted_words[i + 1]["text"]
+                role, confidence = classify_column_header(phrase)
+                if confidence >= 0.70:
+                    col_roles.append((role, sorted_words[i]["x0"]))
+                    if role not in ("skip", "unknown"):
+                        score += 1
+                    i += 2
+                    matched = True
+
+        if not matched:
+            # Single-word fallback
+            role, confidence = classify_column_header(sorted_words[i]["text"])
+            if confidence >= 0.70:
+                col_roles.append((role, sorted_words[i]["x0"]))
+                if role not in ("skip", "unknown"):
+                    score += 1
+            i += 1
+    return score, col_roles
 
 
 def extract_transactions(pdf_path: str) -> list[dict]:
@@ -151,24 +537,22 @@ def _detect_columns(table: list[list[str]], page=None) -> dict | None:
     for header_idx in range(min(3, len(table))):
         row = table[header_idx]
         # Strip newlines and non-ASCII (bilingual headers like "Date\nتاريخ")
-        headers = [re.sub(r"[^\x00-\x7F]", "", cell).replace("\n", " ").lower().strip() for cell in row]
+        raw_headers = [re.sub(r"[^\x00-\x7F]", "", cell).replace("\n", " ").strip() for cell in row]
 
-        col_map = {}
-        for i, h in enumerate(headers):
-            if not h:
-                continue
-            if h in DATE_KEYWORDS or "date" in h:
-                col_map.setdefault("date", i)
-            elif h in DESC_KEYWORDS or "description" in h or "particular" in h or "narration" in h:
-                col_map.setdefault("description", i)
-            elif h in DEBIT_KEYWORDS or "debit" in h or "withdraw" in h or "paid out" in h:
-                col_map.setdefault("debit", i)
-            elif h in CREDIT_KEYWORDS or "credit" in h or "deposit" in h or "paid in" in h:
-                col_map.setdefault("credit", i)
-            elif h in BALANCE_KEYWORDS or "balance" in h:
-                col_map.setdefault("balance", i)
-            elif h in AMOUNT_KEYWORDS or "amount" in h:
-                col_map.setdefault("amount", i)
+        col_map: dict = {}
+        assigned: set[str] = set()
+
+        # Two-pass: high-confidence first, then fill gaps with lower-confidence
+        for min_conf in (0.85, 0.65):
+            for i, raw_h in enumerate(raw_headers):
+                if not raw_h:
+                    continue
+                role, confidence = classify_column_header(raw_h)
+                if role in ("unknown", "skip"):
+                    continue
+                if role not in assigned and confidence >= min_conf:
+                    col_map[role] = i
+                    assigned.add(role)
 
         # "amount" is a single column combining debit/credit — still valid
         has_amounts = ("debit" in col_map or "credit" in col_map or "balance" in col_map or "amount" in col_map)
@@ -194,7 +578,8 @@ def _detect_columns_from_page_words(page, num_table_cols: int) -> dict | None:
 
     When table headers aren't part of the extracted table data, this detects
     header keywords from page words and maps them to table column indices by
-    x-coordinate order.
+    x-coordinate order.  Uses _score_header_line so multi-word headers like
+    "Transaction Date" or "Paid Out" are matched as a phrase.
     """
     if num_table_cols < 3:
         return None
@@ -206,65 +591,40 @@ def _detect_columns_from_page_words(page, num_table_cols: int) -> dict | None:
     # Group words by y-position
     lines_by_top = defaultdict(list)
     for w in words:
-        lines_by_top[round(w['top'])].append(w)
+        lines_by_top[round(w["top"])].append(w)
 
-    # Find a line with multiple column header keywords
-    header_kws = {
-        "date", "description", "particulars", "narration", "transaction",
-        "withdrawal", "withdrawals", "debit", "dr",
-        "deposit", "deposits", "credit", "cr",
-        "balance", "amount",
-    }
-
-    best_line = None
+    # Find the line with the highest column-header score
+    best_line_words: list | None = None
     best_score = 0
-    for top, line_words in lines_by_top.items():
-        score = sum(1 for w in line_words if w['text'].lower() in header_kws)
+    best_col_roles: list = []
+
+    for line_words in lines_by_top.values():
+        sorted_lw = sorted(line_words, key=lambda w: w["x0"])
+        score, col_roles = _score_header_line(sorted_lw)
         if score > best_score:
             best_score = score
-            best_line = line_words
+            best_line_words = sorted_lw
+            best_col_roles = col_roles
 
-    if best_score < 3 or best_line is None:
+    if best_score < 2 or best_line_words is None:
         return None
-
-    # Sort header words by x-position and map to column indices
-    header_words_sorted = sorted(best_line, key=lambda w: w['x0'])
-    header_roles = []
-    for w in header_words_sorted:
-        text = w['text'].lower()
-        if text in ('date',):
-            header_roles.append(('date', w['x0']))
-        elif text in ('description', 'particulars', 'narration', 'transaction'):
-            header_roles.append(('description', w['x0']))
-        elif text in ('reference', 'ref', 'cheque', 'check'):
-            header_roles.append(('skip', w['x0']))  # Skip reference/cheque columns
-        elif text in ('withdrawal', 'withdrawals', 'debit'):
-            header_roles.append(('debit', w['x0']))
-        elif text in ('deposit', 'deposits', 'credit'):
-            header_roles.append(('credit', w['x0']))
-        elif text == 'balance':
-            header_roles.append(('balance', w['x0']))
-        elif text == 'amount':
-            header_roles.append(('amount', w['x0']))
-        # Skip words like "No", "No." (part of "Reference No")
 
     # Map header roles to table column indices by position order
-    # We expect the headers to appear in the same order as table columns
-    if len(header_roles) < 3:
-        return None
-
-    col_map = {"header_row_count": 0}
+    col_map: dict = {"header_row_count": 0}
     col_idx = 0
-    for role, _ in header_roles:
+    assigned: set[str] = set()
+    for role, _ in best_col_roles:
         if col_idx >= num_table_cols:
             break
-        if role != 'skip':
+        if role not in ("skip", "unknown") and role not in assigned:
             col_map[role] = col_idx
+            assigned.add(role)
         col_idx += 1
 
-    if 'date' not in col_map:
+    if "date" not in col_map:
         return None
-    if 'balance' not in col_map and 'debit' not in col_map and 'credit' not in col_map:
+    has_amounts = "balance" in col_map or "debit" in col_map or "credit" in col_map or "amount" in col_map
+    if not has_amounts:
         return None
 
     return col_map
@@ -385,6 +745,19 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
             return row[idx].strip()
         return ""
 
+    # ── Pre-filter: scan full row text FIRST ────────────────────────────────
+    # Any cell in the row may carry header/footer content (pdfplumber sometimes
+    # merges page header text into whatever column overlaps its x-coordinates).
+    # Checking the whole row here is faster and more robust than per-column checks.
+    row_text = " ".join(str(c) for c in row).lower()
+    if any(phrase in row_text for phrase in SKIP_PHRASES):
+        return None
+    if _IBAN_RE.search(" ".join(str(c) for c in row)):
+        return None
+    # Any cell > 500 chars is certainly a header/footer dump, not transaction data
+    if any(len(str(c)) > 500 for c in row):
+        return None
+
     date = get("date")
     # Normalize whitespace around date separators (pdfplumber wraps wide-table cells)
     # e.g. "27-Sep- 2025" → "27-Sep-2025", "15-Oct- 2025" → "15-Oct-2025"
@@ -394,11 +767,24 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         return None
 
     description = re.sub(r"\s+", " ", get("description")).strip()
+    # If the description column was merged with a ref-number column (pdfplumber
+    # sometimes collapses narrow adjacent columns), strip the leading code.
+    if "reference" not in col_map and "ref" not in col_map:
+        description = _strip_leading_ref(description)
 
-    # Skip summary/total rows that happen to contain a date
-    row_text = " ".join(row).lower()
-    if any(phrase in row_text for phrase in SKIP_PHRASES):
+    # Skip rows where the description is a page-header dump:
+    # (1) Description starts with a known header pattern (e.g. "ACCOUNT STATEMENT FROM...")
+    if any(p.match(description) for p in _DESC_HEADER_RES):
         return None
+    # (2) IBAN number present → clearly account metadata, not a transaction
+    if _IBAN_RE.search(description):
+        return None
+    # (3) Excessively long description → likely captured header block
+    if len(description) > 300:
+        return None
+
+    # Strip footer/metadata merged into the description
+    description = _clean_description(description)
 
     balance = _clean_amount(get("balance"))
 
@@ -511,28 +897,41 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 credit = ""
                 balance = ""
 
+                amount_raw = ""  # for single "amount" column
                 for w in line_words[1:]:  # Skip the date word
-                    x = w['x0']
-                    text = w['text']
+                    x = w["x0"]
+                    text = w["text"]
 
                     # Skip "Cr." / "Dr." suffixes on balance
                     if text in ("Cr.", "Dr.", "CR", "DR"):
                         continue
 
+                    is_number = bool(AMOUNT_RE.match(text.replace(",", "")))
+
                     if x >= col_boundaries["balance_x"] - 15:
                         balance = text
                     elif col_boundaries.get("credit_x") and x >= col_boundaries["credit_x"] - 15:
-                        if AMOUNT_RE.match(text.replace(",", "")):
+                        if is_number:
                             credit = text
                         else:
                             description_parts.append(text)
                     elif col_boundaries.get("debit_x") and x >= col_boundaries["debit_x"] - 15:
-                        if AMOUNT_RE.match(text.replace(",", "")):
+                        if is_number:
                             debit = text
+                        else:
+                            description_parts.append(text)
+                    elif col_boundaries.get("amount_x") and x >= col_boundaries["amount_x"] - 15:
+                        # Single signed-amount column (Dr/Cr combined)
+                        if is_number:
+                            amount_raw = text
                         else:
                             description_parts.append(text)
                     else:
                         description_parts.append(text)
+
+                # Split combined amount column into debit / credit
+                if amount_raw and not debit and not credit:
+                    debit, credit = _split_signed_amount(amount_raw, unsigned_is_debit=False)
 
                 desc = " ".join(description_parts)
                 if pending_desc_lines:
@@ -547,7 +946,13 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 if not debit and not credit and not balance:
                     continue
 
-                # Skip summary rows
+                # Skip page-header dumps and summary rows
+                if any(p.match(desc) for p in _DESC_HEADER_RES):
+                    continue
+                if _IBAN_RE.search(desc) or len(desc) > 300:
+                    continue
+                # Strip footer/metadata merged into the description
+                desc = _clean_description(desc)
                 row_text = (date + " " + desc).lower()
                 if any(phrase in row_text for phrase in SKIP_PHRASES):
                     continue
@@ -566,61 +971,53 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
 def _detect_word_columns(words: list[dict]) -> dict | None:
     """Detect column x-positions from header words on a page.
 
-    Finds the header row by looking for a line with multiple column keywords,
-    then extracts x-positions from that specific line.
+    Uses _score_header_line so multi-word headers like "Transaction Date",
+    "Value Date", "Paid Out", "Paid In", "Running Balance" are matched as
+    phrases, not just individual words.
     """
     # Group words by y-position
     lines_by_top = defaultdict(list)
     for w in words:
-        lines_by_top[round(w['top'])].append(w)
+        lines_by_top[round(w["top"])].append(w)
 
-    # Find the line with the most column header keywords
-    best_line = None
+    # Find the line with the highest column-header score
+    best_line: list | None = None
     best_score = 0
-    header_kws = {
-        "date", "description", "particulars", "narration",
-        "withdrawal", "withdrawals", "debit", "dr",
-        "deposit", "deposits", "credit", "cr",
-        "balance", "amount",
-    }
+    best_col_roles: list = []
 
-    for top, line_words in lines_by_top.items():
-        score = sum(1 for w in line_words if w['text'].lower() in header_kws)
+    for line_words in lines_by_top.values():
+        sorted_lw = sorted(line_words, key=lambda w: w["x0"])
+        score, col_roles = _score_header_line(sorted_lw)
         if score > best_score:
             best_score = score
-            best_line = line_words
+            best_line = sorted_lw
+            best_col_roles = col_roles
 
-    if best_score < 3 or best_line is None:
+    if best_score < 2 or best_line is None:
         return None
 
-    header_map = {}
-    for w in best_line:
-        text = w['text'].lower()
-        x = w['x0']
-        if text == 'date' and 'date' not in header_map:
-            header_map['date'] = x
-        elif text in ('description', 'particulars', 'narration'):
-            header_map.setdefault('desc', x)
-        elif text in ('withdrawal', 'withdrawals', 'debit'):
-            header_map.setdefault('debit', x)
-        elif text in ('deposit', 'deposits', 'credit'):
-            header_map.setdefault('credit', x)
-        elif text == 'balance':
-            header_map.setdefault('balance', x)
-        elif text == 'amount':
-            header_map.setdefault('amount', x)
+    # Build x-position map from matched roles (first occurrence wins)
+    header_map: dict[str, float] = {}
+    for role, x in best_col_roles:
+        if role not in ("skip", "unknown") and role not in header_map:
+            header_map[role] = x
+        # Normalise "description" key to "desc" for downstream compatibility
+        if role == "description" and "desc" not in header_map:
+            header_map["desc"] = x
 
-    if 'date' not in header_map:
+    if "date" not in header_map:
         return None
-    if 'balance' not in header_map and 'debit' not in header_map and 'credit' not in header_map:
+    has_amounts = "balance" in header_map or "debit" in header_map or "credit" in header_map or "amount" in header_map
+    if not has_amounts:
         return None
 
     return {
-        "date_x": header_map.get('date', 0),
-        "desc_x": header_map.get('desc', header_map.get('date', 0) + 60),
-        "debit_x": header_map.get('debit'),
-        "credit_x": header_map.get('credit'),
-        "balance_x": header_map.get('balance', 500),
+        "date_x":    header_map.get("date", 0),
+        "desc_x":    header_map.get("desc", header_map.get("date", 0) + 60),
+        "debit_x":   header_map.get("debit"),
+        "credit_x":  header_map.get("credit"),
+        "balance_x": header_map.get("balance", header_map.get("amount", 500)),
+        "amount_x":  header_map.get("amount"),
     }
 
 
@@ -660,6 +1057,18 @@ def _is_noise_line(line: str) -> bool:
     if "current account transactions" in line_lower:
         return True
     if line_lower.startswith("iban:") or line_lower.startswith("branch:") or line_lower.startswith("currency:"):
+        return True
+    # Lines containing an IBAN number are account metadata, not transactions
+    if _IBAN_RE.search(line):
+        return True
+    # Footer / contact info lines
+    if any(marker in line_lower for marker in _DESC_FOOTER_MARKERS):
+        return True
+    # Phone numbers embedded in a short line (e.g. "600 500 946" or "+971 4 123 4567")
+    if re.search(r"\b(?:\+\d{1,3}\s?)?\d[\d\s\-]{7,}\d\b", line) and len(line) < 50:
+        return True
+    # Lines containing © or Arabic characters mixed with bank/address info
+    if "©" in line or re.search(r"[\u0600-\u06FF]", line):
         return True
     return False
 
@@ -803,6 +1212,8 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     desc_end = trailing_amounts[0].start()
     description = rest[:desc_end].strip()
     description = re.sub(r"\s+", " ", description).strip()
+    description = _strip_leading_ref(description)
+    description = _clean_description(description)
 
     amount_strs = [m.group(1) for m in trailing_amounts]
 
@@ -847,6 +1258,36 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
         "credit": credit,
         "balance": f"{balance_val:,.2f}",
     }
+
+
+# Regex for a leading reference/transaction code in a description field.
+# Matches an all-alphanumeric token (letters+digits, no spaces/specials) that:
+#   • is at least 6 characters long
+#   • contains at least one digit (so it's not a plain English word)
+#   • is followed by a space and more text (not the entire description)
+# Examples matched: "P104736051", "TXN20240201", "CHQ001234", "REF123456"
+# Examples NOT matched: "From", "Invoice", "SALARY" (no digits or too short)
+_REF_CODE_RE = re.compile(r"^([A-Za-z]{0,4}\d{6,}[A-Za-z0-9]*)\s+(?=\S)")
+
+
+def _strip_leading_ref(description: str) -> str:
+    """Remove a leading reference/transaction code from a description string.
+
+    Called as a safety net when column detection may have merged the ref-number
+    column with the description column (e.g. pdfplumber merging narrow PDF cols).
+
+    Only strips when the first token:
+      - is entirely alphanumeric (A-Z, 0-9 only, no spaces or special chars)
+      - contains at least one letter AND at least one digit (looks like a code)
+      - is at least 6 characters long
+      - is followed by more content (not the whole description)
+    """
+    m = _REF_CODE_RE.match(description)
+    if m:
+        remainder = description[m.end():].strip()
+        if remainder:  # Only strip if there's still content left
+            return remainder
+    return description
 
 
 def _clean_amount(value: str) -> str:

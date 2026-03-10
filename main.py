@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from extractor.pdf_parser import extract_tables_from_pdf
-from extractor.excel_writer import write_tables_to_excel
+from extractor.excel_writer import write_tables_to_excel, write_tables_to_sheet
 
 
 def get_pdf_files(input_path: str) -> list[Path]:
@@ -55,17 +55,9 @@ def process_single_pdf(pdf_path: Path, output_path: Path) -> None:
 def process_multiple_pdfs(pdf_files: list[Path], output_path: Path) -> None:
     """Process multiple PDFs into a single Excel file with separate sheets."""
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
     wb = Workbook()
     wb.remove(wb.active)  # Remove default sheet
-
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
 
     for pdf_path in pdf_files:
         print(f"Processing: {pdf_path.name}")
@@ -79,31 +71,8 @@ def process_multiple_pdfs(pdf_files: list[Path], output_path: Path) -> None:
         print(f"  Found {len(tables)} table(s) with {total_rows} total row(s)")
 
         # Create sheet with PDF filename (truncated to 31 chars for Excel limit)
-        sheet_name = pdf_path.stem[:31]
-        ws = wb.create_sheet(title=sheet_name)
-
-        current_row = 1
-        for table in tables:
-            for row_idx, row_data in enumerate(table):
-                for col_idx, value in enumerate(row_data):
-                    cell = ws.cell(row=current_row, column=col_idx + 1, value=value)
-                    cell.border = thin_border
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-                    if row_idx == 0:
-                        cell.font = header_font
-                        cell.fill = header_fill
-                    else:
-                        cell.font = Font(size=11)
-                current_row += 1
-            current_row += 1
-
-        for col in ws.columns:
-            max_length = 0
-            col_letter = col[0].column_letter
-            for cell in col:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            ws.column_dimensions[col_letter].width = min(max_length + 4, 50)
+        ws = wb.create_sheet(title=pdf_path.stem[:31])
+        write_tables_to_sheet(ws, tables)
 
     if not wb.sheetnames:
         print("Error: No data extracted from any PDF files.")
