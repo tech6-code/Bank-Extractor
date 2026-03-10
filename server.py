@@ -2,12 +2,15 @@
 
 import logging
 import tempfile
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
@@ -18,7 +21,37 @@ logging.getLogger("extractor.pdf_parser").setLevel(logging.DEBUG)
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Bank Statement Converter API")
+TEMP_DIR = Path(tempfile.gettempdir()) / "bank-statement-extractor"
+TEMP_DIR.mkdir(exist_ok=True)
+
+FILE_TTL_SECONDS = 3600  # 1 hour
+
+
+def _purge_stale_files() -> None:
+    """Delete temp files older than FILE_TTL_SECONDS (runs on startup)."""
+    cutoff = time.time() - FILE_TTL_SECONDS
+    removed = sum(
+        1 for f in TEMP_DIR.iterdir()
+        if f.is_file() and f.stat().st_mtime < cutoff and not f.unlink()
+    )
+    if removed:
+        logger.info("Purged %d stale temp file(s) on startup", removed)
+
+
+def _cleanup_after_download(file_id: str) -> None:
+    """Delete the PDF and XLSX for a file_id and evict from cache."""
+    for ext in (".pdf", ".xlsx"):
+        (TEMP_DIR / f"{file_id}{ext}").unlink(missing_ok=True)
+    _cache.pop(file_id, None)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _purge_stale_files()
+    yield
+
+
+app = FastAPI(title="Bank Statement Converter API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,9 +59,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-TEMP_DIR = Path(tempfile.gettempdir()) / "bank-statement-extractor"
-TEMP_DIR.mkdir(exist_ok=True)
 
 COLUMNS = ["Date", "Description", "Debit", "Credit", "Balance"]
 
@@ -154,6 +184,7 @@ async def download_excel(file_id: str):
         path=str(xlsx_path),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename="bank_statement.xlsx",
+        background=BackgroundTask(_cleanup_after_download, file_id),
     )
 
 
