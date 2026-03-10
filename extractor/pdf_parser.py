@@ -291,10 +291,14 @@ def _strip_page_header_prefix(description: str) -> str:
          Inward Telex Payment/Cellular Tech FZC/..."
 
     We find the LAST occurrence of a known metadata field pattern (Currency, Branch,
-    Page, IBAN …) and return everything that follows it as the real description.
-    Returns "" if no metadata boundary can be located (caller should skip the row).
+    Page, IBAN …) within the first 200 characters (the header block is always at the
+    start) and return everything that follows it as the real description.
+    Returns "" if no metadata boundary can be located.
     """
-    matches = list(_PAGE_META_FIELD_RE.finditer(description))
+    # Limit search to the first 200 chars so that words like "Branch" or "Currency"
+    # appearing inside the real description don't cause a false truncation point.
+    search_in = description[:200]
+    matches = list(_PAGE_META_FIELD_RE.finditer(search_in))
     if not matches:
         return ""
     remainder = description[matches[-1].end():].strip()
