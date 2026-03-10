@@ -168,14 +168,34 @@ SKIP_PHRASES = [
 # Regex to detect IBAN numbers in description text (clear sign of a header dump)
 _IBAN_RE = re.compile(r"\b[A-Z]{2}\d{15,}\b")
 
-# Description starts with these → the entire row is a page header, not a transaction
+# Description starts with these → page header content was merged in by pdfplumber.
+# We try to strip the header prefix and recover the real description; only skip the
+# row entirely if no real description can be extracted after the header block.
 _DESC_HEADER_RES = [
     re.compile(r"^account statement\b", re.IGNORECASE),
     re.compile(r"^your bank statement\b", re.IGNORECASE),
     re.compile(r"^statement of account\b", re.IGNORECASE),
     re.compile(r"^account summary\b", re.IGNORECASE),
     re.compile(r"^summary of account", re.IGNORECASE),
+    re.compile(r"^transaction history\b", re.IGNORECASE),
 ]
+
+# Matches a single page-header metadata field (keyword + value).
+# Used to find where the page header block ends inside a contaminated description cell,
+# e.g. "Transaction history Acme Corp Currency AED Branch Al Tawar Branch <real desc>"
+#                                       ^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^
+# Taking the end position of the LAST match gives the start of the real description.
+_PAGE_META_FIELD_RE = re.compile(
+    r"(?:"
+    r"currency\s+[A-Z]{2,4}"                             # Currency AED
+    r"|page\s+(?:number\s+)?\d+"                          # Page 1 / Page number 1
+    r"|account\s+(?:type|number|no\.?|holder)\s+\S+"      # Account type / Account number
+    r"|iban\s+[A-Z]{2}[\dA-Z]{10,}"                      # IBAN AE86041...
+    r"|statement\s+period\s+\S+"                          # Statement period ...
+    r"|branch(?:\s+\S+){1,3}"                            # Branch Al Tawar Branch
+    r")",
+    re.IGNORECASE,
+)
 
 # When these phrases appear INSIDE a description, everything from that point onward
 # is footer/contact info that was merged into the description — truncate there.
@@ -186,6 +206,7 @@ _DESC_FOOTER_MARKERS = [
     "for queries", "for complaints", "for any query",
     "this is a digital stamp", "standard terms", "terms and conditions",
     "does not require signature", "wio bank pjsc", "po box",
+    "transaction history",
 ]
 
 # Regex: truncate at © symbol or start of Arabic/RTL block mid-description
@@ -257,6 +278,27 @@ def _clean_description(description: str) -> str:
             run_len = 0
 
     return description
+
+
+def _strip_page_header_prefix(description: str) -> str:
+    """Extract the real transaction text from a description contaminated with page header content.
+
+    Some bilingual bank statements (e.g. Sharjah Islamic Bank) have a page-header
+    block whose x-coordinates overlap the description column.  pdfplumber merges it
+    into the first cell of the table, producing text like:
+
+        "Transaction history DMM CONSULTING LLC Currency AED Branch Al Tawar Branch
+         Inward Telex Payment/Cellular Tech FZC/..."
+
+    We find the LAST occurrence of a known metadata field pattern (Currency, Branch,
+    Page, IBAN …) and return everything that follows it as the real description.
+    Returns "" if no metadata boundary can be located (caller should skip the row).
+    """
+    matches = list(_PAGE_META_FIELD_RE.finditer(description))
+    if not matches:
+        return ""
+    remainder = description[matches[-1].end():].strip()
+    return remainder if len(remainder) > 5 else ""
 
 
 def classify_column_header(header: str) -> tuple[str, float]:
@@ -745,19 +787,35 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
             return row[idx].strip()
         return ""
 
-    # ── Pre-filter: scan full row text FIRST ────────────────────────────────
-    # Any cell in the row may carry header/footer content (pdfplumber sometimes
-    # merges page header text into whatever column overlaps its x-coordinates).
-    # Checking the whole row here is faster and more robust than per-column checks.
-    row_text = " ".join(str(c) for c in row).lower()
-    if any(phrase in row_text for phrase in SKIP_PHRASES):
-        return None
-    if _IBAN_RE.search(" ".join(str(c) for c in row)):
-        return None
     # Any cell > 500 chars is certainly a header/footer dump, not transaction data
     if any(len(str(c)) > 500 for c in row):
         return None
 
+    # ── Pre-clean description BEFORE row-level filters ───────────────────────
+    # pdfplumber can merge page-header content (IBAN, "account type", etc.) into
+    # the description cell of the first table row on each page.  If we run the
+    # SKIP_PHRASES / IBAN row-scan first we will falsely discard valid rows.
+    # Strip the header prefix now so the row-scan sees clean text.
+    description = re.sub(r"\s+", " ", get("description")).strip()
+    if "reference" not in col_map and "ref" not in col_map:
+        description = _strip_leading_ref(description)
+    if any(p.match(description) for p in _DESC_HEADER_RES):
+        description = _strip_page_header_prefix(description)
+        # Don't drop the row — it still has valid financial data (date, amounts, balance)
+
+    # ── Pre-filter: scan row using the cleaned description ───────────────────
+    desc_idx = col_map.get("description")
+    scan_row = [
+        description if i == desc_idx else str(c)
+        for i, c in enumerate(row)
+    ]
+    row_text = " ".join(scan_row).lower()
+    if any(phrase in row_text for phrase in SKIP_PHRASES):
+        return None
+    if _IBAN_RE.search(" ".join(scan_row)):
+        return None
+
+    # ── Date ─────────────────────────────────────────────────────────────────
     date = get("date")
     # Normalize whitespace around date separators (pdfplumber wraps wide-table cells)
     # e.g. "27-Sep- 2025" → "27-Sep-2025", "15-Oct- 2025" → "15-Oct-2025"
@@ -766,20 +824,11 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     if not date or not any(p.search(date) for p in DATE_PATTERNS):
         return None
 
-    description = re.sub(r"\s+", " ", get("description")).strip()
-    # If the description column was merged with a ref-number column (pdfplumber
-    # sometimes collapses narrow adjacent columns), strip the leading code.
-    if "reference" not in col_map and "ref" not in col_map:
-        description = _strip_leading_ref(description)
-
-    # Skip rows where the description is a page-header dump:
-    # (1) Description starts with a known header pattern (e.g. "ACCOUNT STATEMENT FROM...")
-    if any(p.match(description) for p in _DESC_HEADER_RES):
-        return None
-    # (2) IBAN number present → clearly account metadata, not a transaction
+    # ── Description (already extracted and header-stripped above) ────────────
+    # (2) IBAN still present in the salvaged text → account metadata, not a transaction
     if _IBAN_RE.search(description):
         return None
-    # (3) Excessively long description → likely captured header block
+    # (3) Still excessively long after stripping → likely un-recoverable header block
     if len(description) > 300:
         return None
 
