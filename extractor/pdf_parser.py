@@ -163,6 +163,12 @@ SKIP_PHRASES = [
     "account statement from",
     "account type", "account holder",
     "if no issues are reported",
+    # Footer / disclaimer text that pdfplumber merges into rows
+    "confirmation of the correctness", "correctness of the statement",
+    "electronically generated statement", "does not require a signature",
+    "does not require . a signature",
+    "no notice of disagreement", "paid up capital",
+    "registered details: emirates",
 ]
 
 # Regex to detect IBAN numbers in description text (clear sign of a header dump)
@@ -205,8 +211,13 @@ _DESC_FOOTER_MARKERS = [
     "call center", "call centre", "if you have any", "should you have any",
     "for queries", "for complaints", "for any query",
     "this is a digital stamp", "standard terms", "terms and conditions",
-    "does not require signature", "wio bank pjsc", "po box",
+    "does not require signature", "does not require . a signature",
+    "wio bank pjsc", "po box",
     "transaction history",
+    "confirmation of the correctness", "correctness of the statement",
+    "electronically generated", "registered details",
+    "no notice of disagreement", "paid up capital",
+    "tax registration number",
 ]
 
 # Regex: truncate at © symbol or start of Arabic/RTL block mid-description
@@ -479,16 +490,41 @@ def extract_transactions(pdf_path: str) -> list[dict]:
 
     # Strategy 1: structured table extraction
     transactions = _extract_from_tables(pdf_path)
-    if transactions:
+    if transactions and not _has_merged_rows(transactions):
         return transactions
 
     # Strategy 2: position-based word extraction (for PDFs without table structures)
+    # Also used as fallback when Strategy 1 produces merged rows
+    if transactions:
+        logger.info("Strategy 1 produced merged rows, falling back to word/text extraction")
     transactions = _extract_from_words(pdf_path)
     if transactions:
         return transactions
 
     # Strategy 3: text-based line parsing
     return _extract_from_text(pdf_path)
+
+
+def _has_merged_rows(transactions: list[dict]) -> bool:
+    """Detect if table extraction produced merged rows (multiple transactions per row).
+
+    When pdfplumber can't detect row boundaries, it merges all rows on a page into
+    a single row.  The telltale sign: the date field contains multiple dates separated
+    by spaces (e.g. "22/01/2025 22/01/2025 20/01/2025 19/01/2025").
+    """
+    if not transactions:
+        return False
+    merged_count = 0
+    for txn in transactions:
+        date = txn.get("date", "")
+        # Count how many date patterns appear in the date field
+        date_matches = []
+        for p in DATE_PATTERNS:
+            date_matches.extend(p.findall(date))
+        if len(date_matches) > 1:
+            merged_count += 1
+    # If more than 30% of rows have multiple dates, extraction is broken
+    return merged_count > len(transactions) * 0.3
 
 
 def _extract_from_tables(pdf_path: Path) -> list[dict]:
@@ -504,6 +540,8 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                 logger.debug(f"Page {page_num}: no tables found")
                 continue
 
+            logger.debug(f"Page {page_num}: found {len(tables)} table(s), rows per table: {[len(t) for t in tables]}")
+
             for table in tables:
                 cleaned = _clean_table(table)
                 if not cleaned:
@@ -511,6 +549,9 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
 
                 num_cols = len(cleaned[0])
                 logger.debug(f"Page {page_num}: table with {len(cleaned)} rows, {num_cols} cols, first row: {cleaned[0][:3]}...")
+                if len(cleaned) <= 3:
+                    for ri, r in enumerate(cleaned):
+                        logger.debug(f"  Row {ri}: {[c[:50] for c in r]}")
 
                 # If col_map was detected for a different column count, reset it
                 if col_map is not None and num_cols != col_map_num_cols:
@@ -791,8 +832,8 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
             return row[idx].strip()
         return ""
 
-    # Any cell > 500 chars is certainly a header/footer dump, not transaction data
-    if any(len(str(c)) > 500 for c in row):
+    # Any cell > 2000 chars is certainly a header/footer dump, not transaction data
+    if any(len(str(c)) > 2000 for c in row):
         return None
 
     # ── Pre-clean description BEFORE row-level filters ───────────────────────
@@ -803,7 +844,8 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     description = re.sub(r"\s+", " ", get("description")).strip()
     if "reference" not in col_map and "ref" not in col_map:
         description = _strip_leading_ref(description)
-    if any(p.match(description) for p in _DESC_HEADER_RES):
+    header_was_contaminated = any(p.match(description) for p in _DESC_HEADER_RES)
+    if header_was_contaminated:
         description = _strip_page_header_prefix(description)
         # Don't drop the row — it still has valid financial data (date, amounts, balance)
 
@@ -816,7 +858,10 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     row_text = " ".join(scan_row).lower()
     if any(phrase in row_text for phrase in SKIP_PHRASES):
         return None
-    if _IBAN_RE.search(" ".join(scan_row)):
+    # Only check for IBAN in rows that were header-contaminated (page header merged
+    # into description).  Normal transaction descriptions often contain IBAN-like
+    # reference numbers (e.g. "AE600260000959054852801") that are NOT metadata.
+    if header_was_contaminated and _IBAN_RE.search(" ".join(scan_row)):
         return None
 
     # ── Date ─────────────────────────────────────────────────────────────────
@@ -829,11 +874,9 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         return None
 
     # ── Description (already extracted and header-stripped above) ────────────
-    # (2) IBAN still present in the salvaged text → account metadata, not a transaction
-    if _IBAN_RE.search(description):
-        return None
-    # (3) Still excessively long after stripping → likely un-recoverable header block
-    if len(description) > 300:
+    # Only reject on IBAN if the description was header-contaminated and still
+    # contains an IBAN after stripping — indicates unrecoverable header content.
+    if header_was_contaminated and _IBAN_RE.search(description):
         return None
 
     # Strip footer/metadata merged into the description
@@ -924,6 +967,7 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
             for w in words:
                 lines_by_top[round(w['top'])].append(w)
 
+            last_date_y = None  # y-position of the most recent date line
             for top in sorted(lines_by_top.keys()):
                 line_words = sorted(lines_by_top[top], key=lambda w: w['x0'])
                 if not line_words:
@@ -934,16 +978,34 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 if not any(p.match(first_text) for p in DATE_PATTERNS):
                     # Non-date line — accumulate as description
                     line_text = " ".join(w['text'] for w in line_words)
-                    if not _is_noise_line(line_text):
-                        if transactions and not pending_desc_lines:
-                            # Continuation of previous transaction
-                            prev = transactions[-1]
-                            prev["description"] = (prev["description"] + " " + line_text).strip()
-                        else:
-                            pending_desc_lines.append(line_text)
+                    if _is_noise_line(line_text):
+                        # If this noise line contains column headers, clear pending
+                        # (everything accumulated before was page header metadata)
+                        line_lower = line_text.lower()
+                        header_kws = {"date", "description", "withdrawal", "deposit",
+                                      "balance", "narration", "particulars", "debit", "credit"}
+                        if len(set(line_lower.split()) & header_kws) >= 3:
+                            pending_desc_lines = []
+                        continue
+                    # Decide: continuation of previous transaction or pending for next?
+                    # Use y-gap: if close to the last date line (<15px), it's continuation.
+                    # Otherwise, it's a pending description for the next transaction.
+                    is_continuation = (
+                        transactions
+                        and not pending_desc_lines
+                        and last_date_y is not None
+                        and (top - last_date_y) < 18
+                    )
+                    if is_continuation:
+                        prev = transactions[-1]
+                        prev["description"] = (prev["description"] + " " + line_text).strip()
+                        last_date_y = top  # Extend the "current transaction" zone
+                    else:
+                        pending_desc_lines.append(line_text)
                     continue
 
                 # Date line — extract column values by x-position
+                last_date_y = top
                 date = first_text
                 description_parts = []
                 debit = ""
@@ -956,7 +1018,7 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                     text = w["text"]
 
                     # Skip "Cr." / "Dr." suffixes on balance
-                    if text in ("Cr.", "Dr.", "CR", "DR"):
+                    if text.rstrip(".").upper() in ("CR", "DR"):
                         continue
 
                     is_number = bool(AMOUNT_RE.match(text.replace(",", "")))
@@ -1000,9 +1062,12 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                     continue
 
                 # Skip page-header dumps and summary rows
-                if any(p.match(desc) for p in _DESC_HEADER_RES):
-                    continue
-                if _IBAN_RE.search(desc) or len(desc) > 300:
+                header_contaminated = any(p.match(desc) for p in _DESC_HEADER_RES)
+                if header_contaminated:
+                    desc = _strip_page_header_prefix(desc)
+                    if not desc:
+                        continue
+                if header_contaminated and _IBAN_RE.search(desc):
                     continue
                 # Strip footer/metadata merged into the description
                 desc = _clean_description(desc)
@@ -1103,6 +1168,8 @@ def _is_noise_line(line: str) -> bool:
     # Page header / metadata lines
     if "your bank statement" in line_lower:
         return True
+    if "statement of account" in line_lower:
+        return True
     if "statement period" in line_lower or "date issued" in line_lower:
         return True
     if "account type" in line_lower or "account number" in line_lower:
@@ -1111,8 +1178,10 @@ def _is_noise_line(line: str) -> bool:
         return True
     if line_lower.startswith("iban:") or line_lower.startswith("branch:") or line_lower.startswith("currency:"):
         return True
-    # Lines containing an IBAN number are account metadata, not transactions
-    if _IBAN_RE.search(line):
+    # Lines that are ONLY an IBAN number (no other content) are metadata
+    # Don't filter lines where IBAN-like refs appear as part of transaction descriptions
+    stripped = line.strip()
+    if _IBAN_RE.fullmatch(stripped) or (line_lower.startswith("iban") and len(stripped) < 60):
         return True
     # Footer / contact info lines
     if any(marker in line_lower for marker in _DESC_FOOTER_MARKERS):
@@ -1120,8 +1189,12 @@ def _is_noise_line(line: str) -> bool:
     # Phone numbers embedded in a short line (e.g. "600 500 946" or "+971 4 123 4567")
     if re.search(r"\b(?:\+\d{1,3}\s?)?\d[\d\s\-]{7,}\d\b", line) and len(line) < 50:
         return True
-    # Lines containing © or Arabic characters mixed with bank/address info
-    if "©" in line or re.search(r"[\u0600-\u06FF]", line):
+    # Lines that are ONLY Arabic/RTL characters (no English transaction content)
+    if "©" in line:
+        return True
+    ascii_alnum = sum(1 for c in line if c.isascii() and c.isalnum())
+    arabic_chars = len(re.findall(r"[\u0600-\u06FF]", line))
+    if arabic_chars > 0 and ascii_alnum < 5 and len(line) > 5:
         return True
     return False
 
