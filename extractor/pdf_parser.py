@@ -151,24 +151,31 @@ SKIP_COL_KEYWORDS = {
     "mode",
 }
 
-# Rows containing these phrases (case-insensitive) are not real transactions
+# Rows containing these phrases (case-insensitive) are not real transactions.
+# These are financial summary lines that should ALWAYS be skipped, even in
+# header-contaminated rows — they are never real transaction descriptions.
 SKIP_PHRASES = [
     "total records", "total debit", "total credit", "grand total",
     "opening balance", "closing balance", "balance brought", "balance carried",
-    "statement summary", "account summary", "end of statement",
+    "statement summary", "end of statement",
     "balance b/f", "balance c/f", "brought forward", "carried forward",
-    # Page header / account info markers
     "summary of accounts", "summary of savings",
+]
+
+# Softer skip phrases — only applied when the row is NOT header-contaminated.
+# These appear in page headers that pdfplumber may merge into data rows;
+# skipping them on contaminated rows would kill valid first-row transactions.
+_SOFT_SKIP_PHRASES = [
     "please review this account statement",
     "account statement from",
     "account type", "account holder",
     "if no issues are reported",
-    # Footer / disclaimer text that pdfplumber merges into rows
     "confirmation of the correctness", "correctness of the statement",
     "electronically generated statement", "does not require a signature",
     "does not require . a signature",
     "no notice of disagreement", "paid up capital",
     "registered details: emirates",
+    "account summary",
 ]
 
 # Regex to detect IBAN numbers in description text (clear sign of a header dump)
@@ -210,15 +217,17 @@ _DESC_FOOTER_MARKERS = [
     "customer service", "please call", "helpline", "toll free",
     "call center", "call centre", "if you have any", "should you have any",
     "for queries", "for complaints", "for any query",
-    "this is a digital stamp", "standard terms", "terms and conditions",
+    "this is a digital stamp",
     "does not require signature", "does not require . a signature",
-    "wio bank pjsc", "po box",
-    "transaction history",
+    "wio bank pjsc",
     "confirmation of the correctness", "correctness of the statement",
-    "electronically generated", "registered details",
+    "electronically generated statement", "registered details: emirates",
     "no notice of disagreement", "paid up capital",
     "tax registration number",
 ]
+# These markers are only truncated when they appear far enough into the text
+# (>= _FOOTER_MIN_POS chars in).  Short descriptions must not be destroyed.
+_FOOTER_MIN_POS = 30
 
 # Regex: truncate at © symbol or start of Arabic/RTL block mid-description
 _DESC_POISON_RE = re.compile(
@@ -245,22 +254,28 @@ def _clean_description(description: str) -> str:
       2. Arabic characters or © copyright symbol appearing mid-text
       3. Trailing phone-number sequences
       4. Next-page column headers merged in (e.g. "... Amount Balance Date Ref. Number")
+
+    The function is deliberately conservative: it only truncates when the marker
+    appears well past the start of the text (_FOOTER_MIN_POS chars in) so that
+    short or medium-length descriptions are never accidentally destroyed.
     """
     if not description:
         return description
 
-    # 1. Truncate at known footer text markers
+    # 1. Truncate at known footer text markers — only when they appear far enough
+    #    into the description that there is meaningful content before the marker.
     desc_lower = description.lower()
     for marker in _DESC_FOOTER_MARKERS:
         idx = desc_lower.find(marker)
-        if idx > 10:
+        if idx >= _FOOTER_MIN_POS:
             description = description[:idx].strip()
             desc_lower = description.lower()
             break
 
     # 2. Truncate at © or first Arabic character (clearly non-transaction content)
+    #    Only if there's enough real content before it.
     m = _DESC_POISON_RE.search(description)
-    if m and m.start() > 10:
+    if m and m.start() >= _FOOTER_MIN_POS:
         description = description[:m.start()].strip()
 
     # 3. Strip trailing phone-number-like digit sequences
@@ -268,7 +283,9 @@ def _clean_description(description: str) -> str:
 
     # 4. Detect consecutive column-header words merged into description.
     #    e.g. "Owais Arshad Khan Amount Balance Date Ref. Number Description..."
-    #    Three or more consecutive words that all classify as column headers → truncate.
+    #    Require at least 4 consecutive header words AND real content before them
+    #    to avoid false positives on descriptions containing words like "Balance"
+    #    or "Credit" in normal transaction text.
     words = description.split()
     run_start: int | None = None
     run_len = 0
@@ -276,12 +293,12 @@ def _clean_description(description: str) -> str:
         # Strip punctuation/brackets but keep dots (for "Ref.")
         clean_word = re.sub(r"[^A-Za-z0-9.]", "", word)
         role, conf = classify_column_header(clean_word)
-        if conf >= 0.80 and role in _COL_HEADER_ROLES:
+        if conf >= 0.85 and role in _COL_HEADER_ROLES:
             if run_start is None:
                 run_start = i
             run_len += 1
-            # Require at least 3 consecutive header words AND real content before them
-            if run_len >= 3 and run_start > 0:
+            # Require at least 4 consecutive header words AND real content before them
+            if run_len >= 4 and run_start > 0:
                 description = " ".join(words[:run_start]).strip()
                 break
         else:
@@ -304,16 +321,173 @@ def _strip_page_header_prefix(description: str) -> str:
     We find the LAST occurrence of a known metadata field pattern (Currency, Branch,
     Page, IBAN …) within the first 200 characters (the header block is always at the
     start) and return everything that follows it as the real description.
-    Returns "" if no metadata boundary can be located.
+    Returns "" if no metadata boundary can be located via metadata fields,
+    but tries a fallback: skip past the header-trigger pattern itself and
+    return whatever follows.
     """
     # Limit search to the first 200 chars so that words like "Branch" or "Currency"
     # appearing inside the real description don't cause a false truncation point.
     search_in = description[:200]
     matches = list(_PAGE_META_FIELD_RE.finditer(search_in))
-    if not matches:
+    if matches:
+        remainder = description[matches[-1].end():].strip()
+        if len(remainder) > 3:
+            return remainder
+
+    # Fallback: skip past the header-trigger pattern that flagged this as contaminated.
+    # e.g. "Account statement Salary Transfer From XYZ" → "Salary Transfer From XYZ"
+    for p in _DESC_HEADER_RES:
+        m = p.search(description)
+        if m:
+            remainder = description[m.end():].strip()
+            if len(remainder) > 3:
+                return remainder
+
+    return ""
+
+
+def _recover_description_from_words(page, row_idx: int, table_bbox: tuple | None,
+                                     col_map: dict, table: list[list[str]]) -> str:
+    """Recover a transaction description by reading word positions from the PDF page.
+
+    When table extraction gives an empty or header-contaminated description (common
+    for the first row on each page), we fall back to extracting words from the page
+    that overlap the description column's x-range and the row's y-range.
+
+    Args:
+        page: pdfplumber page object
+        row_idx: index of the row in the table (0-based, after header skip)
+        table_bbox: bounding box of the table on the page, or None
+        col_map: column mapping dict
+        table: the cleaned table data
+
+    Returns:
+        Recovered description string, or "" if recovery fails.
+    """
+    if page is None or "description" not in col_map:
         return ""
-    remainder = description[matches[-1].end():].strip()
-    return remainder if len(remainder) > 5 else ""
+
+    try:
+        words = page.extract_words()
+        if not words:
+            return ""
+
+        # Get the description column index
+        desc_idx = col_map["description"]
+
+        # We need to find the y-range for this row. Use the table's bounding box
+        # and distribute rows evenly, or find the date word's y-position.
+        date_idx = col_map.get("date")
+        date_val = table[row_idx][date_idx].strip() if date_idx is not None and date_idx < len(table[row_idx]) else ""
+        if not date_val:
+            return ""
+
+        # Find the date word on the page to anchor the y-position
+        target_y = None
+        for w in words:
+            if w["text"].strip() == date_val.split()[0]:  # Match first part of date
+                target_y = w["top"]
+                break
+
+        # Fallback: try partial date match
+        if target_y is None:
+            date_fragment = date_val[:6]  # e.g. "01/03/" or "01-Mar"
+            for w in words:
+                if date_fragment in w["text"]:
+                    target_y = w["top"]
+                    break
+
+        if target_y is None:
+            return ""
+
+        # Collect all words on the same y-line (within tolerance)
+        y_tolerance = 5
+        row_words = [w for w in words if abs(w["top"] - target_y) <= y_tolerance]
+        if not row_words:
+            return ""
+
+        # Sort by x-position
+        row_words.sort(key=lambda w: w["x0"])
+
+        # Determine x-boundaries for the description column.
+        # The description starts after the date column and ends before the next
+        # numeric column (debit/credit/amount/balance).
+        # Use column headers' x-positions if available from word-based detection,
+        # otherwise estimate from the table structure.
+
+        # Find x-ranges of non-description columns to exclude
+        # Collect x-positions of amount-like words (numbers with decimals/commas)
+        amount_words_x = []
+        for w in row_words:
+            if AMOUNT_RE.match(w["text"].replace(",", "")):
+                amount_words_x.append(w["x0"])
+
+        # Description words: not the date word, not amount words, and between
+        # the date's x-end and the first amount's x-start
+        date_word_end = None
+        for w in row_words:
+            if w["text"].strip().startswith(date_val.split()[0][:4]):
+                date_word_end = w["x1"]
+                break
+
+        if date_word_end is None:
+            date_word_end = row_words[0]["x1"] if row_words else 0
+
+        # First amount x-position marks the end of description zone
+        desc_end_x = min(amount_words_x) - 5 if amount_words_x else float("inf")
+
+        desc_parts = []
+        for w in row_words:
+            # Skip words that are before the description column
+            if w["x0"] < date_word_end - 2:
+                continue
+            # Skip words that are in numeric columns
+            if w["x0"] >= desc_end_x:
+                continue
+            # Skip pure numbers (they belong to amount columns)
+            if AMOUNT_RE.match(w["text"].replace(",", "")):
+                continue
+            # Skip date words
+            if any(p.match(w["text"]) for p in DATE_PATTERNS):
+                continue
+            desc_parts.append(w["text"])
+
+        # Also check continuation lines (words on y-lines just below the date line)
+        # These are multi-line descriptions within the same table row.
+        continuation_y_max = target_y + 40  # Look up to ~40px below
+        next_date_y = float("inf")
+        # Find the next row's date to limit how far down we look
+        for w in words:
+            if w["top"] > target_y + y_tolerance and any(p.match(w["text"]) for p in DATE_PATTERNS):
+                next_date_y = w["top"]
+                break
+
+        continuation_y_max = min(continuation_y_max, next_date_y - 2)
+
+        for w in words:
+            if w["top"] <= target_y + y_tolerance:
+                continue
+            if w["top"] > continuation_y_max:
+                continue
+            if w["x0"] < date_word_end - 2:
+                continue
+            if w["x0"] >= desc_end_x:
+                continue
+            if AMOUNT_RE.match(w["text"].replace(",", "")):
+                continue
+            desc_parts.append(w["text"])
+
+        recovered = " ".join(desc_parts).strip()
+        recovered = re.sub(r"\s+", " ", recovered)
+
+        # Don't return if it's just noise
+        if recovered and not _is_noise_line(recovered):
+            return recovered
+
+    except Exception as e:
+        logger.debug(f"Description recovery from words failed: {e}")
+
+    return ""
 
 
 def classify_column_header(header: str) -> tuple[str, float]:
@@ -601,18 +775,46 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                                     break
                         col_map["unsigned_is_debit"] = has_explicit_plus
 
-                # Skip header rows — detect repeated headers on each page
+                # Skip header rows — detect repeated headers on each page.
+                # A row is a header ONLY if:
+                #   1) It contains header keywords, AND
+                #   2) The date column does NOT contain a valid date.
+                # This prevents skipping a data row whose description happens
+                # to contain "balance" or "credit" (common transaction words).
                 skip = col_map.get("header_row_count", 0)
                 start = 0
                 if skip > 0 and len(cleaned) > skip:
-                    # Check if first row looks like the header (contains header keywords)
-                    first_row_text = " ".join(cleaned[0]).lower()
-                    if any(kw in first_row_text for kw in ("date", "description", "narration", "debit", "credit", "balance", "particulars")):
-                        start = skip
+                    date_col_idx = col_map.get("date")
+                    for hdr_i in range(skip):
+                        if hdr_i >= len(cleaned):
+                            break
+                        hdr_row = cleaned[hdr_i]
+                        hdr_row_text = " ".join(hdr_row).lower()
+                        has_header_kws = any(kw in hdr_row_text for kw in (
+                            "date", "description", "narration", "debit",
+                            "credit", "balance", "particulars",
+                        ))
+                        # Check if this row has a valid date — if so, it's data, not header
+                        date_cell = hdr_row[date_col_idx].strip() if date_col_idx is not None and date_col_idx < len(hdr_row) else ""
+                        date_cell = re.sub(r"\s*([/\-.])\s*", r"\1", date_cell)
+                        has_valid_date = bool(date_cell and any(p.search(date_cell) for p in DATE_PATTERNS))
 
-                for row in cleaned[start:]:
+                        if has_header_kws and not has_valid_date:
+                            start = hdr_i + 1
+                        else:
+                            break  # Stop skipping — this row has data
+
+                for ri, row in enumerate(cleaned[start:]):
                     txn = _row_to_transaction(row, col_map)
                     if txn:
+                        # If description is empty or very short, try word-position recovery
+                        if len(txn["description"]) < 3:
+                            recovered = _recover_description_from_words(
+                                page, start + ri, None, col_map, cleaned
+                            )
+                            if recovered:
+                                txn["description"] = recovered
+                                logger.debug(f"Page {page_num}: recovered description for row {start + ri}: {txn['description'][:60]}...")
                         transactions.append(txn)
 
     return transactions
@@ -836,35 +1038,7 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     if any(len(str(c)) > 2000 for c in row):
         return None
 
-    # ── Pre-clean description BEFORE row-level filters ───────────────────────
-    # pdfplumber can merge page-header content (IBAN, "account type", etc.) into
-    # the description cell of the first table row on each page.  If we run the
-    # SKIP_PHRASES / IBAN row-scan first we will falsely discard valid rows.
-    # Strip the header prefix now so the row-scan sees clean text.
-    description = re.sub(r"\s+", " ", get("description")).strip()
-    if "reference" not in col_map and "ref" not in col_map:
-        description = _strip_leading_ref(description)
-    header_was_contaminated = any(p.match(description) for p in _DESC_HEADER_RES)
-    if header_was_contaminated:
-        description = _strip_page_header_prefix(description)
-        # Don't drop the row — it still has valid financial data (date, amounts, balance)
-
-    # ── Pre-filter: scan row using the cleaned description ───────────────────
-    desc_idx = col_map.get("description")
-    scan_row = [
-        description if i == desc_idx else str(c)
-        for i, c in enumerate(row)
-    ]
-    row_text = " ".join(scan_row).lower()
-    if any(phrase in row_text for phrase in SKIP_PHRASES):
-        return None
-    # Only check for IBAN in rows that were header-contaminated (page header merged
-    # into description).  Normal transaction descriptions often contain IBAN-like
-    # reference numbers (e.g. "AE600260000959054852801") that are NOT metadata.
-    if header_was_contaminated and _IBAN_RE.search(" ".join(scan_row)):
-        return None
-
-    # ── Date ─────────────────────────────────────────────────────────────────
+    # ── Date (check early so we can skip non-transaction rows fast) ─────────
     date = get("date")
     # Normalize whitespace around date separators (pdfplumber wraps wide-table cells)
     # e.g. "27-Sep- 2025" → "27-Sep-2025", "15-Oct- 2025" → "15-Oct-2025"
@@ -873,14 +1047,42 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     if not date or not any(p.search(date) for p in DATE_PATTERNS):
         return None
 
-    # ── Description (already extracted and header-stripped above) ────────────
-    # Only reject on IBAN if the description was header-contaminated and still
-    # contains an IBAN after stripping — indicates unrecoverable header content.
-    if header_was_contaminated and _IBAN_RE.search(description):
-        return None
+    # ── Pre-clean description BEFORE row-level filters ───────────────────────
+    # pdfplumber can merge page-header content (IBAN, "account type", etc.) into
+    # the description cell of the first table row on each page.  If we run the
+    # SKIP_PHRASES / IBAN row-scan first we will falsely discard valid rows.
+    # Strip the header prefix now so the row-scan sees clean text.
+    description = re.sub(r"\s+", " ", get("description")).strip()
+    header_was_contaminated = any(p.match(description) for p in _DESC_HEADER_RES)
+    if header_was_contaminated:
+        cleaned_desc = _strip_page_header_prefix(description)
+        # Even if stripping returned empty, keep the row — it has valid date/amounts.
+        # The description may be lost but the transaction data is still valuable.
+        description = cleaned_desc  # may be "" — that's OK
 
-    # Strip footer/metadata merged into the description
-    description = _clean_description(description)
+    # ── Pre-filter: skip financial summary rows (totals, opening/closing balance)
+    # For header-contaminated rows, ONLY check non-description cells with hard
+    # SKIP_PHRASES.  For normal rows, check everything including soft phrases.
+    desc_idx = col_map.get("description")
+    if header_was_contaminated:
+        # Scan only non-description cells — the description has page-header pollution
+        scan_row = [
+            "" if i == desc_idx else str(c)
+            for i, c in enumerate(row)
+        ]
+        row_text = " ".join(scan_row).lower()
+        # Only hard skip phrases (totals, balance b/f, etc.) — NOT soft phrases
+        # that appear in page headers like "account type", "account holder"
+        if any(phrase in row_text for phrase in SKIP_PHRASES):
+            return None
+    else:
+        row_text = " ".join(str(c) for c in row).lower()
+        if any(phrase in row_text for phrase in SKIP_PHRASES):
+            return None
+        if any(phrase in row_text for phrase in _SOFT_SKIP_PHRASES):
+            return None
+
+    # Description is kept exactly as extracted from the PDF — no regex cleaning.
 
     balance = _clean_amount(get("balance"))
 
@@ -988,13 +1190,15 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                             pending_desc_lines = []
                         continue
                     # Decide: continuation of previous transaction or pending for next?
-                    # Use y-gap: if close to the last date line (<15px), it's continuation.
+                    # Use y-gap: if close to the last date line (<25px), it's continuation.
                     # Otherwise, it's a pending description for the next transaction.
+                    # A wider gap (25px vs old 18px) catches multi-line descriptions
+                    # that span 2-3 lines within a single table row.
                     is_continuation = (
                         transactions
                         and not pending_desc_lines
                         and last_date_y is not None
-                        and (top - last_date_y) < 18
+                        and (top - last_date_y) < 25
                     )
                     if is_continuation:
                         prev = transactions[-1]
@@ -1061,19 +1265,20 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 if not debit and not credit and not balance:
                     continue
 
-                # Skip page-header dumps and summary rows
+                # Clean page-header dumps from description but keep the transaction
                 header_contaminated = any(p.match(desc) for p in _DESC_HEADER_RES)
                 if header_contaminated:
-                    desc = _strip_page_header_prefix(desc)
-                    if not desc:
+                    stripped = _strip_page_header_prefix(desc)
+                    desc = stripped if stripped else desc
+                    # Don't skip — the row has valid date + amounts even if desc is empty
+
+                # Description is kept exactly as extracted — no regex cleaning.
+
+                # Only apply SKIP_PHRASES when NOT header-contaminated
+                if not header_contaminated:
+                    row_text = (date + " " + desc).lower()
+                    if any(phrase in row_text for phrase in SKIP_PHRASES):
                         continue
-                if header_contaminated and _IBAN_RE.search(desc):
-                    continue
-                # Strip footer/metadata merged into the description
-                desc = _clean_description(desc)
-                row_text = (date + " " + desc).lower()
-                if any(phrase in row_text for phrase in SKIP_PHRASES):
-                    continue
 
                 transactions.append({
                     "date": date,
@@ -1157,11 +1362,11 @@ def _is_noise_line(line: str) -> bool:
     words = set(line_lower.split())
     if len(words & header_kws) >= 3:
         return True
-    # Common footer patterns
-    if "national bank" in line_lower or "central bank" in line_lower:
-        return True
-    if "regulated" in line_lower and "licensed" in line_lower:
-        return True
+    # Common footer patterns — only match when the line is short (clearly metadata,
+    # not a transaction description mentioning a bank name)
+    if len(line) < 80:
+        if ("regulated" in line_lower and "licensed" in line_lower):
+            return True
     # Page number patterns like "[52] نم [2] ةحفص" or "Page [2] of [52]"
     if re.search(r"\[\d+\]\s*(of|نم)\s*\[\d+\]", line, re.IGNORECASE):
         return True
@@ -1187,8 +1392,11 @@ def _is_noise_line(line: str) -> bool:
     if any(marker in line_lower for marker in _DESC_FOOTER_MARKERS):
         return True
     # Phone numbers embedded in a short line (e.g. "600 500 946" or "+971 4 123 4567")
-    if re.search(r"\b(?:\+\d{1,3}\s?)?\d[\d\s\-]{7,}\d\b", line) and len(line) < 50:
-        return True
+    # Only match very short lines that are predominantly phone numbers
+    if len(line) < 25:
+        phone_match = re.search(r"\b(?:\+\d{1,3}\s?)?\d[\d\s\-]{7,}\d\b", line)
+        if phone_match and (phone_match.end() - phone_match.start()) > len(line) * 0.5:
+            return True
     # Lines that are ONLY Arabic/RTL characters (no English transaction content)
     if "©" in line:
         return True
@@ -1338,8 +1546,6 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     desc_end = trailing_amounts[0].start()
     description = rest[:desc_end].strip()
     description = re.sub(r"\s+", " ", description).strip()
-    description = _strip_leading_ref(description)
-    description = _clean_description(description)
 
     amount_strs = [m.group(1) for m in trailing_amounts]
 
