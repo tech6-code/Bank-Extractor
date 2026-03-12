@@ -662,15 +662,40 @@ def extract_transactions(pdf_path: str) -> list[dict]:
     if pdf_path.suffix.lower() != ".pdf":
         raise ValueError(f"Not a PDF file: {pdf_path}")
 
-    # Strategy 1: structured table extraction
-    transactions = _extract_from_tables(pdf_path)
-    if transactions and not _has_merged_rows(transactions):
+    # Strategy 1: table-based extraction — run PyMuPDF and pdfplumber in parallel,
+    # then use whichever yields more valid (non-merged) transactions.
+    # PyMuPDF uses visual ruling-line detection so it captures the first data row
+    # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
+    pymupdf_txns = _extract_from_pymupdf(pdf_path)
+    pdfplumber_txns = _extract_from_tables(pdf_path)
+
+    pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
+    pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
+
+    if pymupdf_ok or pdfplumber_ok:
+        if pymupdf_ok and pdfplumber_ok:
+            # Both found valid transactions — prefer whichever found more rows.
+            # PyMuPDF typically wins by the number of first-row-per-page it captures.
+            transactions = (
+                pymupdf_txns if len(pymupdf_txns) >= len(pdfplumber_txns)
+                else pdfplumber_txns
+            )
+            source = "pymupdf" if transactions is pymupdf_txns else "pdfplumber"
+        elif pymupdf_ok:
+            transactions = pymupdf_txns
+            source = "pymupdf"
+        else:
+            transactions = pdfplumber_txns
+            source = "pdfplumber"
+
+        logger.info(
+            f"Strategy 1 ({source}): {len(transactions)} transactions "
+            f"(pymupdf={len(pymupdf_txns)}, pdfplumber={len(pdfplumber_txns)})"
+        )
         return transactions
 
     # Strategy 2: position-based word extraction (for PDFs without table structures)
-    # Also used as fallback when Strategy 1 produces merged rows
-    if transactions:
-        logger.info("Strategy 1 produced merged rows, falling back to word/text extraction")
+    logger.info("Table strategies found 0 valid transactions, trying Strategy 2 (words)")
     transactions = _extract_from_words(pdf_path)
     if transactions:
         return transactions
@@ -716,20 +741,25 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
 
             logger.debug(f"Page {page_num}: found {len(tables)} table(s), rows per table: {[len(t) for t in tables]}")
 
-            for table in tables:
+            # Track where this page's transactions start so we can supplement
+            # with a word scan after all tables are processed.
+            page_start_idx = len(transactions)
+
+            for ti, table in enumerate(tables):
                 cleaned = _clean_table(table)
                 if not cleaned:
+                    logger.debug(f"Page {page_num}: table {ti} empty after cleaning")
                     continue
 
                 num_cols = len(cleaned[0])
-                logger.debug(f"Page {page_num}: table with {len(cleaned)} rows, {num_cols} cols, first row: {cleaned[0][:3]}...")
-                if len(cleaned) <= 3:
+                logger.info(f"Page {page_num}, table {ti}: {len(cleaned)} rows, {num_cols} cols, first row: {[c[:40] for c in cleaned[0]]}")
+                if len(cleaned) <= 5:
                     for ri, r in enumerate(cleaned):
-                        logger.debug(f"  Row {ri}: {[c[:50] for c in r]}")
+                        logger.info(f"  Page {page_num}, table {ti}, row {ri}: {[c[:50] for c in r]}")
 
-                # If col_map was detected for a different column count, reset it
+                # If col_map was detected for a different column count, try re-detecting
                 if col_map is not None and num_cols != col_map_num_cols:
-                    logger.debug(f"Page {page_num}: col_map has {col_map_num_cols} cols but table has {num_cols} cols, re-detecting")
+                    logger.info(f"Page {page_num}, table {ti}: col_map has {col_map_num_cols} cols but table has {num_cols} cols, re-detecting")
                     new_map = _detect_columns(cleaned, page)
                     if new_map:
                         col_map = new_map
@@ -747,8 +777,15 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                                         break
                             col_map["unsigned_is_debit"] = has_explicit_plus
                     else:
-                        # Can't detect for this table, skip it
-                        continue
+                        # Re-detection failed. If the table has MORE cols than col_map needs,
+                        # still try processing with existing col_map (columns may just be offset).
+                        # If fewer cols, skip — the existing col_map indices would be out of range.
+                        max_col_idx = max(v for k, v in col_map.items() if isinstance(v, int))
+                        if num_cols > max_col_idx:
+                            logger.info(f"Page {page_num}, table {ti}: re-detection failed but table has enough cols ({num_cols} > max_idx {max_col_idx}), trying existing col_map")
+                        else:
+                            logger.info(f"Page {page_num}, table {ti}: skipping table (re-detection failed, {num_cols} cols < needed {max_col_idx + 1})")
+                            continue
 
                 # Detect column mapping once
                 if col_map is None:
@@ -775,48 +812,300 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                                     break
                         col_map["unsigned_is_debit"] = has_explicit_plus
 
-                # Skip header rows — detect repeated headers on each page.
-                # A row is a header ONLY if:
-                #   1) It contains header keywords, AND
-                #   2) The date column does NOT contain a valid date.
-                # This prevents skipping a data row whose description happens
-                # to contain "balance" or "credit" (common transaction words).
-                skip = col_map.get("header_row_count", 0)
-                start = 0
-                if skip > 0 and len(cleaned) > skip:
-                    date_col_idx = col_map.get("date")
-                    for hdr_i in range(skip):
-                        if hdr_i >= len(cleaned):
-                            break
-                        hdr_row = cleaned[hdr_i]
-                        hdr_row_text = " ".join(hdr_row).lower()
-                        has_header_kws = any(kw in hdr_row_text for kw in (
-                            "date", "description", "narration", "debit",
-                            "credit", "balance", "particulars",
-                        ))
-                        # Check if this row has a valid date — if so, it's data, not header
-                        date_cell = hdr_row[date_col_idx].strip() if date_col_idx is not None and date_col_idx < len(hdr_row) else ""
-                        date_cell = re.sub(r"\s*([/\-.])\s*", r"\1", date_cell)
-                        has_valid_date = bool(date_cell and any(p.search(date_cell) for p in DATE_PATTERNS))
-
-                        if has_header_kws and not has_valid_date:
-                            start = hdr_i + 1
-                        else:
-                            break  # Stop skipping — this row has data
-
-                for ri, row in enumerate(cleaned[start:]):
+                # Process ALL rows — no header skipping.
+                # _row_to_transaction() validates the date column; header rows
+                # (containing "Date" / "التاريخ" instead of an actual date) are
+                # rejected by the date-pattern check and return None.
+                # This eliminates false skips of first-row data on every page.
+                page_txn_count = 0
+                for ri, row in enumerate(cleaned):
                     txn = _row_to_transaction(row, col_map)
                     if txn:
                         # If description is empty or very short, try word-position recovery
                         if len(txn["description"]) < 3:
                             recovered = _recover_description_from_words(
-                                page, start + ri, None, col_map, cleaned
+                                page, ri, None, col_map, cleaned
                             )
                             if recovered:
                                 txn["description"] = recovered
-                                logger.debug(f"Page {page_num}: recovered description for row {start + ri}: {txn['description'][:60]}...")
+                                logger.debug(f"Page {page_num}: recovered description for row {ri}: {txn['description'][:60]}...")
                         transactions.append(txn)
+                        page_txn_count += 1
+                        # Log first 3 transactions per page for debugging
+                        if page_txn_count <= 3:
+                            logger.info(f"Page {page_num}, table {ti}, row {ri}: EXTRACTED txn #{len(transactions)}: date={txn['date']}, desc={txn['description'][:50]!r}, debit={txn['debit']}, credit={txn['credit']}, balance={txn['balance']}")
+                    else:
+                        # Log first few rejected rows per page too
+                        if ri < 3:
+                            logger.info(f"Page {page_num}, table {ti}, row {ri}: REJECTED (returned None), row={[c[:40] for c in row]}")
+                logger.info(f"Page {page_num}, table {ti}: extracted {page_txn_count} transactions (running total: {len(transactions)})")
 
+            # Supplement: scan page words for any transaction rows that pdfplumber's
+            # table bbox missed (most commonly the first data row of a continuation
+            # page when a full-width banner sits above the table's detected boundary).
+            if col_map is not None:
+                page_txns = transactions[page_start_idx:]
+                missed = _find_missed_rows_word_scan(page, page_txns, col_map)
+                if missed:
+                    for i, m in enumerate(missed):
+                        transactions.insert(page_start_idx + i, m)
+                    logger.info(
+                        f"Page {page_num}: word scan recovered {len(missed)} missed row(s): "
+                        f"{[m['date'] + ' ' + m['description'][:30] for m in missed]}"
+                    )
+
+    logger.info(f"Strategy 1 (_extract_from_tables): total {len(transactions)} transactions extracted")
+    return transactions
+
+
+def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) -> list[dict]:
+    """Find transaction rows visible on the page that were not captured by table extraction.
+
+    pdfplumber's table bbox detection sometimes excludes the first data row of a
+    continuation page because a full-width page banner (e.g. "Transactions Details
+    for the period…") sits between the column-header line and the first data row,
+    causing pdfplumber to start its table boundary below that row.
+
+    This function scans the page's extracted words for date-starting lines, extracts
+    their field values by x-coordinate, and returns any that are not already present
+    in captured_txns (matched by date + balance).
+    """
+    try:
+        words = page.extract_words()
+        if not words:
+            return []
+
+        # Detect column x-positions from the page's header words.
+        col_boundaries = _detect_word_columns(words)
+        if not col_boundaries:
+            return []
+
+        # Build a lookup of already-captured (date, balance) pairs so we can skip
+        # rows that the table extraction already got.  When balance is absent we
+        # fall back to (date, debit, credit) to avoid false collisions.
+        def _key(t: dict) -> tuple:
+            return (t["date"], t["balance"]) if t["balance"] else (t["date"], t["debit"], t["credit"])
+
+        captured_keys = {_key(t) for t in captured_txns}
+
+        # Group words by y-line.
+        lines_by_top: dict = defaultdict(list)
+        for w in words:
+            lines_by_top[round(w["top"])].append(w)
+
+        missed: list[dict] = []
+        for top in sorted(lines_by_top.keys()):
+            line_words = sorted(lines_by_top[top], key=lambda w: w["x0"])
+            if not line_words:
+                continue
+
+            # Only process lines whose first word is a date.
+            first_text = line_words[0]["text"]
+            if not any(p.match(first_text) for p in DATE_PATTERNS):
+                continue
+
+            # Extract field values by x-position (same logic as _extract_from_words).
+            date = first_text
+            description_parts: list[str] = []
+            debit = ""
+            credit = ""
+            balance = ""
+            amount_raw = ""
+
+            for w in line_words[1:]:
+                x = w["x0"]
+                text = w["text"]
+
+                if text.rstrip(".").upper() in ("CR", "DR"):
+                    continue
+
+                is_number = bool(AMOUNT_RE.match(text.replace(",", "")))
+
+                if x >= col_boundaries["balance_x"] - 15:
+                    balance = text
+                elif col_boundaries.get("credit_x") and x >= col_boundaries["credit_x"] - 15:
+                    if is_number:
+                        credit = text
+                    else:
+                        description_parts.append(text)
+                elif col_boundaries.get("debit_x") and x >= col_boundaries["debit_x"] - 15:
+                    if is_number:
+                        debit = text
+                    else:
+                        description_parts.append(text)
+                elif col_boundaries.get("amount_x") and x >= col_boundaries["amount_x"] - 15:
+                    if is_number:
+                        amount_raw = text
+                    else:
+                        description_parts.append(text)
+                else:
+                    description_parts.append(text)
+
+            if amount_raw and not debit and not credit:
+                debit, credit = _split_signed_amount(amount_raw, unsigned_is_debit=False)
+
+            balance = _clean_amount(balance)
+            debit = _clean_amount(debit)
+            credit = _clean_amount(credit)
+
+            if not balance and not debit and not credit:
+                continue
+
+            # Skip summary rows.
+            row_text_lower = (date + " " + " ".join(description_parts)).lower()
+            if any(phrase in row_text_lower for phrase in SKIP_PHRASES):
+                continue
+
+            # Build description: strip any date tokens that leaked in from adjacent
+            # columns (e.g. a "Value Date" column whose x falls in the desc zone).
+            desc = " ".join(description_parts)
+            desc = re.sub(r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}\b", "", desc)
+            desc = re.sub(r"\s+", " ", desc).strip()
+
+            candidate = {"date": date, "description": desc,
+                         "debit": debit, "credit": credit, "balance": balance}
+
+            # Skip if already captured.
+            if _key(candidate) in captured_keys:
+                continue
+
+            missed.append(candidate)
+            captured_keys.add(_key(candidate))  # Avoid duplicating within this scan
+
+        return missed
+
+    except Exception as e:
+        logger.debug(f"Word scan for missed rows failed: {e}")
+        return []
+
+
+def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
+    """Extract transactions using PyMuPDF's visual table finder.
+
+    PyMuPDF detects table row boundaries from the PDF's ruling lines and
+    graphical elements rather than from text-stream coordinates.  This means
+    it correctly captures the first data row on every page — a row that
+    pdfplumber sometimes clips because it sits close to the page-header band
+    and falls just outside pdfplumber's inferred table bounding-box.
+
+    The result is compared against pdfplumber's result in extract_transactions();
+    whichever strategy finds more valid rows is used.
+    """
+    try:
+        import fitz  # PyMuPDF  # noqa: PLC0415
+    except ImportError:
+        logger.debug("PyMuPDF not installed — skipping (pip install pymupdf)")
+        return []
+
+    transactions: list[dict] = []
+    col_map: dict | None = None
+    col_map_num_cols = 0
+
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception as e:
+        logger.warning(f"PyMuPDF could not open PDF: {e}")
+        return []
+
+    try:
+        for page_num, page in enumerate(doc, 1):
+            try:
+                tabs = page.find_tables()
+            except AttributeError:
+                logger.warning(
+                    "PyMuPDF >= 1.23.0 required for find_tables(). "
+                    "Upgrade: pip install --upgrade pymupdf"
+                )
+                return []
+
+            if not tabs.tables:
+                logger.debug(f"PyMuPDF page {page_num}: no tables found")
+                continue
+
+            logger.debug(f"PyMuPDF page {page_num}: {len(tabs.tables)} table(s)")
+
+            for ti, tab in enumerate(tabs.tables):
+                raw = tab.extract()  # list[list[str | None]]
+                cleaned = _clean_table(raw)
+                if not cleaned:
+                    continue
+
+                num_cols = len(cleaned[0])
+                logger.info(
+                    f"PyMuPDF page {page_num}, table {ti}: "
+                    f"{len(cleaned)} rows × {num_cols} cols, "
+                    f"first row: {[c[:40] for c in cleaned[0]]}"
+                )
+
+                # Re-detect columns when column count changes between pages
+                if col_map is not None and num_cols != col_map_num_cols:
+                    new_map = _detect_columns(cleaned, None)
+                    if new_map:
+                        col_map = new_map
+                        col_map_num_cols = num_cols
+                        logger.info(f"PyMuPDF column mapping re-detected on page {page_num}: {col_map}")
+                        if "amount" in col_map:
+                            amt_idx = col_map["amount"]
+                            skip = col_map.get("header_row_count", 0)
+                            col_map["unsigned_is_debit"] = any(
+                                cleaned[r][amt_idx].strip().startswith("+")
+                                for r in range(skip, min(skip + 30, len(cleaned)))
+                                if amt_idx < len(cleaned[r])
+                            )
+
+                # First-time column detection
+                if col_map is None:
+                    if len(cleaned) < 3:
+                        logger.debug(
+                            f"PyMuPDF page {page_num}, table {ti}: "
+                            f"too few rows ({len(cleaned)}), skipping"
+                        )
+                        continue
+                    col_map = _detect_columns(cleaned, None)
+                    if not col_map:
+                        logger.debug(
+                            f"PyMuPDF page {page_num}, table {ti}: column detection failed"
+                        )
+                        continue
+                    col_map_num_cols = num_cols
+                    logger.info(f"PyMuPDF column mapping detected on page {page_num}: {col_map}")
+                    if "amount" in col_map:
+                        amt_idx = col_map["amount"]
+                        skip = col_map.get("header_row_count", 0)
+                        col_map["unsigned_is_debit"] = any(
+                            cleaned[r][amt_idx].strip().startswith("+")
+                            for r in range(skip, min(skip + 30, len(cleaned)))
+                            if amt_idx < len(cleaned[r])
+                        )
+
+                page_txn_count = 0
+                for ri, row in enumerate(cleaned):
+                    txn = _row_to_transaction(row, col_map)
+                    if txn:
+                        transactions.append(txn)
+                        page_txn_count += 1
+                        if page_txn_count <= 3:
+                            logger.info(
+                                f"PyMuPDF page {page_num}, table {ti}, row {ri}: "
+                                f"txn #{len(transactions)}: date={txn['date']}, "
+                                f"desc={txn['description'][:50]!r}, "
+                                f"debit={txn['debit']}, credit={txn['credit']}, "
+                                f"balance={txn['balance']}"
+                            )
+                    elif ri < 3:
+                        logger.info(
+                            f"PyMuPDF page {page_num}, table {ti}, row {ri}: "
+                            f"REJECTED: {[c[:40] for c in row]}"
+                        )
+
+                logger.info(
+                    f"PyMuPDF page {page_num}, table {ti}: "
+                    f"{page_txn_count} transactions (running total: {len(transactions)})"
+                )
+    finally:
+        doc.close()
+
+    logger.info(f"PyMuPDF strategy: {len(transactions)} transactions extracted")
     return transactions
 
 
@@ -1028,6 +1317,7 @@ def _infer_columns_by_content(table: list[list[str]]) -> dict | None:
 
 def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     """Convert a table row to a transaction dict using column mapping."""
+
     def get(key: str) -> str:
         idx = col_map.get(key)
         if idx is not None and idx < len(row):
@@ -1036,57 +1326,20 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
 
     # Any cell > 2000 chars is certainly a header/footer dump, not transaction data
     if any(len(str(c)) > 2000 for c in row):
+        logger.debug(f"Row rejected (cell >2000 chars): {[c[:40] for c in row]}")
         return None
 
-    # ── Date (check early so we can skip non-transaction rows fast) ─────────
+    # Date check first so we can skip non-transaction rows quickly.
     date = get("date")
-    # Normalize whitespace around date separators (pdfplumber wraps wide-table cells)
-    # e.g. "27-Sep- 2025" → "27-Sep-2025", "15-Oct- 2025" → "15-Oct-2025"
     date = re.sub(r"\s*([/\-.])\s*", r"\1", date)
     date = re.sub(r"\s+", " ", date).strip()
     if not date or not any(p.search(date) for p in DATE_PATTERNS):
+        logger.debug(f"Row rejected (no valid date): date_cell={date!r}, row={[c[:30] for c in row]}")
         return None
 
-    # ── Pre-clean description BEFORE row-level filters ───────────────────────
-    # pdfplumber can merge page-header content (IBAN, "account type", etc.) into
-    # the description cell of the first table row on each page.  If we run the
-    # SKIP_PHRASES / IBAN row-scan first we will falsely discard valid rows.
-    # Strip the header prefix now so the row-scan sees clean text.
-    description = re.sub(r"\s+", " ", get("description")).strip()
-    header_was_contaminated = any(p.match(description) for p in _DESC_HEADER_RES)
-    if header_was_contaminated:
-        cleaned_desc = _strip_page_header_prefix(description)
-        # Even if stripping returned empty, keep the row — it has valid date/amounts.
-        # The description may be lost but the transaction data is still valuable.
-        description = cleaned_desc  # may be "" — that's OK
-
-    # ── Pre-filter: skip financial summary rows (totals, opening/closing balance)
-    # For header-contaminated rows, ONLY check non-description cells with hard
-    # SKIP_PHRASES.  For normal rows, check everything including soft phrases.
-    desc_idx = col_map.get("description")
-    if header_was_contaminated:
-        # Scan only non-description cells — the description has page-header pollution
-        scan_row = [
-            "" if i == desc_idx else str(c)
-            for i, c in enumerate(row)
-        ]
-        row_text = " ".join(scan_row).lower()
-        # Only hard skip phrases (totals, balance b/f, etc.) — NOT soft phrases
-        # that appear in page headers like "account type", "account holder"
-        if any(phrase in row_text for phrase in SKIP_PHRASES):
-            return None
-    else:
-        row_text = " ".join(str(c) for c in row).lower()
-        if any(phrase in row_text for phrase in SKIP_PHRASES):
-            return None
-        if any(phrase in row_text for phrase in _SOFT_SKIP_PHRASES):
-            return None
-
-    # Description is kept exactly as extracted from the PDF — no regex cleaning.
-
+    # Parse amount cells before skip-phrase checks. This prevents valid first-row
+    # transactions (with page-header contamination) from being discarded.
     balance = _clean_amount(get("balance"))
-
-    # Handle single "amount" column (signed values split into debit/credit)
     if "amount" in col_map:
         raw_amount = get("amount")
         unsigned_is_debit = col_map.get("unsigned_is_debit", False)
@@ -1096,7 +1349,47 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         credit = _clean_amount(get("credit"))
 
     if not debit and not credit and not balance:
+        logger.debug(f"Row rejected (no amounts): date={date!r}, row={[c[:30] for c in row]}")
         return None
+
+    # Pre-clean description before row-level filters. The first transaction row on
+    # each page often carries merged page-header metadata in this cell.
+    description = re.sub(r"\s+", " ", get("description")).strip()
+    desc_lower = description.lower()
+    header_was_contaminated = (
+        any(p.match(description) for p in _DESC_HEADER_RES)
+        or bool(_IBAN_RE.search(description[:140]))
+        or (
+            len(description) > 80
+            and (
+                bool(_PAGE_META_FIELD_RE.search(description[:220]))
+                or any(phrase in desc_lower for phrase in _SOFT_SKIP_PHRASES)
+            )
+        )
+    )
+    if header_was_contaminated:
+        cleaned_desc = _strip_page_header_prefix(description)
+        # Keep row even if description recovery returns empty.
+        description = cleaned_desc
+
+    # Skip financial summary rows (totals/opening/closing balance).
+    # For contaminated rows, evaluate only non-description cells.
+    desc_idx = col_map.get("description")
+    if header_was_contaminated:
+        scan_row = ["" if i == desc_idx else str(c) for i, c in enumerate(row)]
+        row_text = " ".join(scan_row).lower()
+        matched_phrase = next((p for p in SKIP_PHRASES if p in row_text), None)
+        if matched_phrase:
+            logger.debug(f"Row rejected (hard skip, contaminated): phrase={matched_phrase!r}, date={date!r}")
+            return None
+    else:
+        row_text = " ".join(str(c) for c in row).lower()
+        matched_phrase = next((p for p in SKIP_PHRASES if p in row_text), None)
+        if matched_phrase:
+            logger.debug(f"Row rejected (hard skip): phrase={matched_phrase!r}, date={date!r}")
+            return None
+        # Do not apply soft-skip phrase rejection for date+amount-valid rows.
+        # Those phrases are common inside header-contaminated first transactions.
 
     return {
         "date": date,
@@ -1105,7 +1398,6 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         "credit": credit,
         "balance": balance,
     }
-
 
 def _split_signed_amount(raw: str, unsigned_is_debit: bool = False) -> tuple[str, str]:
     """Split a signed amount into (debit, credit).
@@ -1661,3 +1953,6 @@ def _clean_table(table: list[list]) -> list[list[str]]:
         if any(cell for cell in cleaned_row):
             cleaned.append(cleaned_row)
     return cleaned
+
+
+
