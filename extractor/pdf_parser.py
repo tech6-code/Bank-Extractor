@@ -894,12 +894,29 @@ def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) 
             lines_by_top[round(w["top"])].append(w)
 
         missed: list[dict] = []
+        processed_tops: set[int] = set()
+
         for top in sorted(lines_by_top.keys()):
-            line_words = sorted(lines_by_top[top], key=lambda w: w["x0"])
+            if top in processed_tops:
+                continue
+
+            # Merge words from y-lines within ±5 px of this top.
+            # In many PDFs the date/amount words and the description words within
+            # the same table row render at slightly different vertical positions
+            # (1–4 px apart).  Without this band-merge the description text ends
+            # up in a separate y-bucket from the date and is never seen.
+            y_tol = 5
+            band_words: list[dict] = []
+            for y, wds in lines_by_top.items():
+                if abs(y - top) <= y_tol:
+                    band_words.extend(wds)
+                    processed_tops.add(y)
+
+            line_words = sorted(band_words, key=lambda w: w["x0"])
             if not line_words:
                 continue
 
-            # Only process lines whose first word is a date.
+            # Only process bands whose leftmost word is a date.
             first_text = line_words[0]["text"]
             if not any(p.match(first_text) for p in DATE_PATTERNS):
                 continue
