@@ -24,6 +24,8 @@ DATE_PATTERNS = [
     re.compile(rf"\b(\d{{1,2}}\s+{_MONTH}\s+\d{{4}})\b", re.IGNORECASE),
     # D-Mon-YYYY / D/Mon/YYYY    e.g. "4-Nov-2025", "4/Nov/2025"
     re.compile(rf"\b(\d{{1,2}}[/\-.]{_MONTH}[/\-.]\d{{4}})\b", re.IGNORECASE),
+    # D-Mon-YY / D/Mon/YY        e.g. "01-MAY-25", "4/Nov/25"  (2-digit year)
+    re.compile(rf"\b(\d{{1,2}}[/\-.]{_MONTH}[/\-.]\d{{2}})\b", re.IGNORECASE),
     # Mon DD, YYYY / Mon DD YYYY (US-style) e.g. "Jan 15, 2024"
     re.compile(rf"\b({_MONTH}\.?\s+\d{{1,2}},?\s+\d{{4}})\b", re.IGNORECASE),
     # Mon-DD-YYYY / Mon/DD/YYYY  (US-style with separator)
@@ -667,7 +669,11 @@ def extract_transactions(pdf_path: str) -> list[dict]:
     # PyMuPDF uses visual ruling-line detection so it captures the first data row
     # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
     pymupdf_txns = _extract_from_pymupdf(pdf_path)
-    pdfplumber_txns = _extract_from_tables(pdf_path)
+    try:
+        pdfplumber_txns = _extract_from_tables(pdf_path)
+    except Exception as e:
+        logger.warning(f"pdfplumber table extraction failed: {e}")
+        pdfplumber_txns = []
 
     pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
     pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
@@ -696,12 +702,19 @@ def extract_transactions(pdf_path: str) -> list[dict]:
 
     # Strategy 2: position-based word extraction (for PDFs without table structures)
     logger.info("Table strategies found 0 valid transactions, trying Strategy 2 (words)")
-    transactions = _extract_from_words(pdf_path)
-    if transactions:
-        return transactions
+    try:
+        transactions = _extract_from_words(pdf_path)
+        if transactions:
+            return transactions
+    except Exception as e:
+        logger.warning(f"Word extraction failed: {e}")
 
     # Strategy 3: text-based line parsing
-    return _extract_from_text(pdf_path)
+    try:
+        return _extract_from_text(pdf_path)
+    except Exception as e:
+        logger.warning(f"Text extraction failed: {e}")
+        return []
 
 
 def _has_merged_rows(transactions: list[dict]) -> bool:
