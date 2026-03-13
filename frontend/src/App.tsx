@@ -321,7 +321,7 @@ function App() {
                   <TableBody>
                     {paginatedRows.map((txn, i) => (
                       <TableRow
-                        key={i}
+                        key={`${txn.date}-${txn.balance}-${i}`}
                         className="border-white/[0.03] hover:bg-white/[0.02] transition-colors"
                       >
                         <TableCell className="whitespace-nowrap text-white/50 text-sm font-mono pl-5">

@@ -13,7 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from extractor.pdf_parser import extract_tables_from_pdf
+from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel, write_tables_to_sheet
 
 
@@ -36,19 +36,28 @@ def get_pdf_files(input_path: str) -> list[Path]:
         sys.exit(1)
 
 
+def _transactions_to_table(transactions: list[dict]) -> list[list[str]]:
+    """Convert transaction dicts to a table (header + data rows)."""
+    COLUMNS = ["Date", "Description", "Debit", "Credit", "Balance"]
+    return [COLUMNS] + [
+        [t["date"], t["description"], t["debit"], t["credit"], t["balance"]]
+        for t in transactions
+    ]
+
+
 def process_single_pdf(pdf_path: Path, output_path: Path) -> None:
     """Process a single PDF and write to Excel."""
     print(f"Processing: {pdf_path.name}")
-    tables = extract_tables_from_pdf(str(pdf_path))
+    transactions = extract_transactions(str(pdf_path))
 
-    if not tables:
+    if not transactions:
         print(f"  Warning: No data found in {pdf_path.name}")
         return
 
-    total_rows = sum(len(t) for t in tables)
-    print(f"  Found {len(tables)} table(s) with {total_rows} total row(s)")
+    print(f"  Found {len(transactions)} transaction(s)")
 
-    result = write_tables_to_excel(tables, str(output_path))
+    table = _transactions_to_table(transactions)
+    result = write_tables_to_excel([table], str(output_path))
     print(f"  Output saved to: {result}")
 
 
@@ -61,18 +70,18 @@ def process_multiple_pdfs(pdf_files: list[Path], output_path: Path) -> None:
 
     for pdf_path in pdf_files:
         print(f"Processing: {pdf_path.name}")
-        tables = extract_tables_from_pdf(str(pdf_path))
+        transactions = extract_transactions(str(pdf_path))
 
-        if not tables:
+        if not transactions:
             print(f"  Warning: No data found in {pdf_path.name}")
             continue
 
-        total_rows = sum(len(t) for t in tables)
-        print(f"  Found {len(tables)} table(s) with {total_rows} total row(s)")
+        print(f"  Found {len(transactions)} transaction(s)")
 
         # Create sheet with PDF filename (truncated to 31 chars for Excel limit)
+        table = _transactions_to_table(transactions)
         ws = wb.create_sheet(title=pdf_path.stem[:31])
-        write_tables_to_sheet(ws, tables)
+        write_tables_to_sheet(ws, [table])
 
     if not wb.sheetnames:
         print("Error: No data extracted from any PDF files.")

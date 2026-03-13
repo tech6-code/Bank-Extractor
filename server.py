@@ -1,9 +1,14 @@
 """FastAPI backend for the Bank Statement Converter."""
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging
+import os
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,8 +21,9 @@ import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
 
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("extractor.pdf_parser").setLevel(logging.DEBUG)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger("extractor.pdf_parser").setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,9 @@ TEMP_DIR = Path(tempfile.gettempdir()) / "bank-statement-extractor"
 TEMP_DIR.mkdir(exist_ok=True)
 
 FILE_TTL_SECONDS = 3600  # 1 hour
+CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "50"))
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
 
 
 def _purge_stale_files() -> None:
@@ -55,15 +64,24 @@ app = FastAPI(title="Bank Statement Converter API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 COLUMNS = ["Date", "Description", "Debit", "Credit", "Balance"]
 
-# In-memory cache: file_id -> extracted transactions
-_cache: dict[str, list[dict]] = {}
+# In-memory LRU cache: file_id -> extracted transactions (evicts oldest when full)
+_cache: OrderedDict[str, list[dict]] = OrderedDict()
+
+
+def _cache_put(file_id: str, transactions: list[dict]) -> None:
+    """Add entry to cache, evicting oldest if over limit."""
+    _cache[file_id] = transactions
+    _cache.move_to_end(file_id)
+    while len(_cache) > CACHE_MAX_ENTRIES:
+        evicted_id, _ = _cache.popitem(last=False)
+        logger.debug("Cache evicted: %s", evicted_id)
 
 
 @app.post("/api/extract")
@@ -76,6 +94,8 @@ async def extract_preview(file: UploadFile):
     pdf_path = TEMP_DIR / f"{file_id}.pdf"
 
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)} MB.")
     pdf_path.write_bytes(content)
 
     try:
@@ -91,7 +111,7 @@ async def extract_preview(file: UploadFile):
         pdf_path.unlink(missing_ok=True)
         raise HTTPException(422, "No transaction data found in the PDF. The parser could not detect structured tables or date-prefixed transaction lines.")
 
-    _cache[file_id] = transactions
+    _cache_put(file_id, transactions)
 
     return {
         "file_id": file_id,
@@ -167,7 +187,7 @@ async def download_excel(file_id: str):
             if not pdf_path.exists():
                 raise HTTPException(404, "File not found. Please re-upload.")
             transactions = extract_transactions(str(pdf_path))
-            _cache[file_id] = transactions
+            _cache_put(file_id, transactions)
 
         # Build a single table: header row + data rows
         table = [COLUMNS] + [
