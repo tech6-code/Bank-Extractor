@@ -20,6 +20,7 @@ from starlette.background import BackgroundTask
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
+from extractor.template_engine import match_template, save_extraction_template
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -84,6 +85,21 @@ def _cache_put(file_id: str, transactions: list[dict]) -> None:
         logger.debug("Cache evicted: %s", evicted_id)
 
 
+def _separate_meta(transactions: list[dict]) -> tuple[list[dict], dict | None]:
+    """Separate extraction metadata from transaction list.
+
+    The extraction pipeline appends a metadata dict (with key "_extraction_meta")
+    as the last element. This separates it from the actual transactions.
+    """
+    if not transactions:
+        return transactions, None
+
+    last = transactions[-1]
+    if isinstance(last, dict) and "_extraction_meta" in last:
+        return transactions[:-1], last["_extraction_meta"]
+    return transactions, None
+
+
 @app.post("/api/extract")
 async def extract_preview(file: UploadFile):
     """Upload a PDF and return extracted transaction data as JSON."""
@@ -100,7 +116,17 @@ async def extract_preview(file: UploadFile):
 
     try:
         logger.info(f"Extracting transactions from {file.filename} ({len(content)} bytes)")
-        transactions = extract_transactions(str(pdf_path))
+
+        # ── Template matching ─────────────────────────────────────────────
+        template = None
+        try:
+            template = match_template(str(pdf_path))
+        except Exception as e:
+            logger.warning(f"Template matching failed (continuing without): {e}")
+
+        # ── Extraction ────────────────────────────────────────────────────
+        raw_transactions = extract_transactions(str(pdf_path), template=template)
+        transactions, meta = _separate_meta(raw_transactions)
         logger.info(f"Extracted {len(transactions)} transactions")
     except Exception as e:
         logger.exception("Extraction failed")
@@ -111,6 +137,33 @@ async def extract_preview(file: UploadFile):
         pdf_path.unlink(missing_ok=True)
         raise HTTPException(422, "No transaction data found in the PDF. The parser could not detect structured tables or date-prefixed transaction lines.")
 
+    # ── Save template if this was a new layout ────────────────────────────
+    template_info = {}
+    if meta:
+        template_info["strategy"] = meta.get("strategy", "unknown")
+        template_info["template_matched"] = meta.get("template_matched", False)
+
+        if meta.get("template_matched"):
+            template_info["template_id"] = meta.get("template_id")
+            template_info["template_bank_name"] = meta.get("template_bank_name")
+        else:
+            # New layout — save as template for future reuse
+            try:
+                col_map = meta.get("col_map", {})
+                strategy = meta.get("strategy", "unknown")
+                template_id = save_extraction_template(
+                    pdf_path=str(pdf_path),
+                    col_map=col_map,
+                    strategy=strategy,
+                    transactions_count=len(transactions),
+                )
+                if template_id:
+                    template_info["template_id"] = template_id
+                    template_info["template_saved"] = True
+                    logger.info(f"New template saved (id={template_id})")
+            except Exception as e:
+                logger.warning(f"Template saving failed (non-critical): {e}")
+
     _cache_put(file_id, transactions)
 
     return {
@@ -119,6 +172,7 @@ async def extract_preview(file: UploadFile):
         "columns": COLUMNS,
         "transactions": transactions,
         "total_rows": len(transactions),
+        "template": template_info,
     }
 
 
@@ -186,7 +240,8 @@ async def download_excel(file_id: str):
             pdf_path = TEMP_DIR / f"{file_id}.pdf"
             if not pdf_path.exists():
                 raise HTTPException(404, "File not found. Please re-upload.")
-            transactions = extract_transactions(str(pdf_path))
+            raw = extract_transactions(str(pdf_path))
+            transactions, _ = _separate_meta(raw)
             _cache_put(file_id, transactions)
 
         # Build a single table: header row + data rows
@@ -206,6 +261,53 @@ async def download_excel(file_id: str):
         filename="bank_statement.xlsx",
         background=BackgroundTask(_cleanup_after_download, file_id),
     )
+
+
+# ── Template Management Endpoints ────────────────────────────────────────────
+
+@app.get("/api/templates")
+async def list_templates():
+    """List all saved templates."""
+    try:
+        from database.db import get_all_templates
+        templates = get_all_templates()
+        return {"templates": templates, "total": len(templates)}
+    except Exception as e:
+        logger.warning(f"Failed to list templates: {e}")
+        return {"templates": [], "total": 0, "error": str(e)}
+
+
+@app.delete("/api/templates/{template_id}")
+async def remove_template(template_id: int):
+    """Delete a template by ID."""
+    try:
+        from database.db import delete_template
+        deleted = delete_template(template_id)
+        if not deleted:
+            raise HTTPException(404, "Template not found.")
+        return {"deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete template: {e}")
+
+
+@app.patch("/api/templates/{template_id}")
+async def update_template(template_id: int, body: dict):
+    """Update a template's bank name."""
+    bank_name = body.get("bank_name")
+    if not bank_name:
+        raise HTTPException(400, "bank_name is required.")
+    try:
+        from database.db import update_template_bank_name
+        updated = update_template_bank_name(template_id, bank_name)
+        if not updated:
+            raise HTTPException(404, "Template not found.")
+        return {"updated": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update template: {e}")
 
 
 if __name__ == "__main__":

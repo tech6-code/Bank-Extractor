@@ -21,12 +21,21 @@ interface Transaction {
   balance: string;
 }
 
+interface TemplateInfo {
+  strategy?: string;
+  template_matched?: boolean;
+  template_id?: number;
+  template_bank_name?: string;
+  template_saved?: boolean;
+}
+
 interface ExtractResult {
   file_id: string;
   filename: string;
   columns: string[];
   transactions: Transaction[];
   total_rows: number;
+  template?: TemplateInfo;
 }
 
 function App() {
@@ -241,6 +250,43 @@ function App() {
         {/* Results */}
         {result && stats && (
           <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {/* Template status badge */}
+            {result.template && (
+              <div className="flex items-center gap-2">
+                {result.template.template_matched ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-1.5">
+                    <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                    </svg>
+                    <span className="text-xs text-emerald-300 font-medium">
+                      Template matched{result.template.template_bank_name ? `: ${result.template.template_bank_name}` : ""}
+                    </span>
+                    <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-400 border-0 text-[10px] uppercase">
+                      {result.template.strategy}
+                    </Badge>
+                  </div>
+                ) : result.template.template_saved ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-blue-500/20 bg-blue-500/5 px-3 py-1.5">
+                    <svg className="w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v6m3-3H9m12 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                    </svg>
+                    <span className="text-xs text-blue-300 font-medium">
+                      New template saved
+                    </span>
+                    <Badge variant="secondary" className="bg-blue-500/10 text-blue-400 border-0 text-[10px] uppercase">
+                      {result.template.strategy}
+                    </Badge>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5">
+                    <span className="text-xs text-white/40 font-medium">
+                      Strategy: {result.template.strategy}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Stats bar */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <StatCard

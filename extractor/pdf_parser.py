@@ -656,24 +656,69 @@ def _score_header_line(sorted_words: list[dict]) -> tuple[int, list[tuple[str, f
     return score, col_roles
 
 
-def extract_transactions(pdf_path: str) -> list[dict]:
-    """Extract structured transactions from a bank statement PDF."""
+def extract_transactions(pdf_path: str, template: dict | None = None) -> list[dict]:
+    """Extract structured transactions from a bank statement PDF.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        template: Optional pre-matched template dict from template_engine.
+                  If provided and contains a valid col_map, extraction will
+                  use the saved column mapping and preferred strategy,
+                  skipping column detection for faster, more accurate results.
+
+    Returns:
+        List of transaction dicts with keys: date, description, debit, credit, balance.
+        The last element may be a metadata dict with key "_extraction_meta" containing
+        strategy used, col_map, and template_matched flag (used by server for template saving).
+    """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
     if pdf_path.suffix.lower() != ".pdf":
         raise ValueError(f"Not a PDF file: {pdf_path}")
 
+    # ── Template-guided extraction ────────────────────────────────────────────
+    # If a matching template was found, use its saved col_map and preferred strategy.
+    if template and template.get("col_map") and template.get("strategy"):
+        saved_col_map = template["col_map"]
+        preferred_strategy = template["strategy"]
+        logger.info(
+            f"Using saved template (id={template.get('id')}, strategy={preferred_strategy}, "
+            f"col_map={saved_col_map})"
+        )
+
+        transactions = _extract_with_template(pdf_path, saved_col_map, preferred_strategy)
+        if transactions:
+            # Append metadata for the server
+            meta = {
+                "_extraction_meta": {
+                    "strategy": preferred_strategy,
+                    "col_map": saved_col_map,
+                    "template_matched": True,
+                    "template_id": template.get("id"),
+                    "template_bank_name": template.get("bank_name"),
+                }
+            }
+            transactions.append(meta)
+            logger.info(
+                f"Template-guided extraction: {len(transactions) - 1} transactions "
+                f"(template_id={template.get('id')})"
+            )
+            return transactions
+        else:
+            logger.warning("Template-guided extraction yielded 0 transactions, falling back to full pipeline")
+
+    # ── Full pipeline (no template or template failed) ────────────────────────
     # Strategy 1: table-based extraction — run PyMuPDF and pdfplumber in parallel,
     # then use whichever yields more valid (non-merged) transactions.
     # PyMuPDF uses visual ruling-line detection so it captures the first data row
     # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
-    pymupdf_txns = _extract_from_pymupdf(pdf_path)
+    pymupdf_txns, pymupdf_col_map = _extract_from_pymupdf(pdf_path)
     try:
-        pdfplumber_txns = _extract_from_tables(pdf_path)
+        pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
     except Exception as e:
         logger.warning(f"pdfplumber table extraction failed: {e}")
-        pdfplumber_txns = []
+        pdfplumber_txns, pdfplumber_col_map = [], None
 
     pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
     pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
@@ -682,22 +727,34 @@ def extract_transactions(pdf_path: str) -> list[dict]:
         if pymupdf_ok and pdfplumber_ok:
             # Both found valid transactions — prefer whichever found more rows.
             # PyMuPDF typically wins by the number of first-row-per-page it captures.
-            transactions = (
-                pymupdf_txns if len(pymupdf_txns) >= len(pdfplumber_txns)
-                else pdfplumber_txns
-            )
-            source = "pymupdf" if transactions is pymupdf_txns else "pdfplumber"
+            if len(pymupdf_txns) >= len(pdfplumber_txns):
+                transactions = pymupdf_txns
+                source = "pymupdf"
+                detected_col_map = pymupdf_col_map
+            else:
+                transactions = pdfplumber_txns
+                source = "pdfplumber"
+                detected_col_map = pdfplumber_col_map
         elif pymupdf_ok:
             transactions = pymupdf_txns
             source = "pymupdf"
+            detected_col_map = pymupdf_col_map
         else:
             transactions = pdfplumber_txns
             source = "pdfplumber"
+            detected_col_map = pdfplumber_col_map
 
         logger.info(
             f"Strategy 1 ({source}): {len(transactions)} transactions "
             f"(pymupdf={len(pymupdf_txns)}, pdfplumber={len(pdfplumber_txns)})"
         )
+        # Append metadata for template saving (include col_map)
+        meta = {"_extraction_meta": {
+            "strategy": source,
+            "template_matched": False,
+            "col_map": detected_col_map or {},
+        }}
+        transactions.append(meta)
         return transactions
 
     # Strategy 2: position-based word extraction (for PDFs without table structures)
@@ -705,16 +762,43 @@ def extract_transactions(pdf_path: str) -> list[dict]:
     try:
         transactions = _extract_from_words(pdf_path)
         if transactions:
+            meta = {"_extraction_meta": {"strategy": "words", "template_matched": False}}
+            transactions.append(meta)
             return transactions
     except Exception as e:
         logger.warning(f"Word extraction failed: {e}")
 
     # Strategy 3: text-based line parsing
     try:
-        return _extract_from_text(pdf_path)
+        transactions = _extract_from_text(pdf_path)
+        if transactions:
+            meta = {"_extraction_meta": {"strategy": "text", "template_matched": False}}
+            transactions.append(meta)
+        return transactions
     except Exception as e:
         logger.warning(f"Text extraction failed: {e}")
         return []
+
+
+def _extract_with_template(
+    pdf_path: Path, col_map: dict, strategy: str,
+) -> list[dict]:
+    """Extract transactions using a saved template's column mapping and strategy.
+
+    This skips column detection entirely — the col_map is already known.
+    Falls back to the full pipeline if the preferred strategy fails.
+    """
+    if strategy == "pymupdf":
+        txns, _ = _extract_from_pymupdf(pdf_path, forced_col_map=col_map)
+        return txns
+    elif strategy == "pdfplumber":
+        txns, _ = _extract_from_tables(pdf_path, forced_col_map=col_map)
+        return txns
+    elif strategy == "words":
+        return _extract_from_words(pdf_path)
+    elif strategy == "text":
+        return _extract_from_text(pdf_path)
+    return []
 
 
 def _has_merged_rows(transactions: list[dict]) -> bool:
@@ -739,11 +823,14 @@ def _has_merged_rows(transactions: list[dict]) -> bool:
     return merged_count > len(transactions) * 0.3
 
 
-def _extract_from_tables(pdf_path: Path) -> list[dict]:
+def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> list[dict]:
     """Extract transactions from structured PDF tables by mapping columns."""
     transactions = []
-    col_map = None  # Detect once, reuse across pages
+    col_map = forced_col_map  # Use template col_map if provided, else detect
     col_map_num_cols = 0  # Number of columns col_map was detected for
+
+    if forced_col_map:
+        logger.info(f"pdfplumber using forced col_map from template: {forced_col_map}")
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
@@ -753,6 +840,31 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                 continue
 
             logger.debug(f"Page {page_num}: found {len(tables)} table(s), rows per table: {[len(t) for t in tables]}")
+
+            # ── Fallback: if default extraction gives a 1-col table but we
+            # already know the PDF has multi-column tables (from a previous
+            # page), retry with text-based column detection.  Some PDFs have
+            # ruling lines only on page 1; subsequent pages rely on text
+            # alignment, which the default "lines" strategy cannot detect.
+            if (
+                col_map is not None
+                and col_map_num_cols > 1
+                and all(len(t[0]) <= 1 for t in tables if t)
+            ):
+                logger.info(
+                    f"Page {page_num}: default extraction gave 1-col table(s) "
+                    f"but expected {col_map_num_cols} cols, retrying with text strategy"
+                )
+                text_tables = page.extract_tables({
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                })
+                if text_tables and any(len(t[0]) > 1 for t in text_tables if t):
+                    tables = text_tables
+                    logger.info(
+                        f"Page {page_num}: text strategy found {len(tables)} table(s) "
+                        f"with {len(tables[0][0]) if tables[0] else 0} cols"
+                    )
 
             # Track where this page's transactions start so we can supplement
             # with a word scan after all tables are processed.
@@ -771,7 +883,8 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                         logger.info(f"  Page {page_num}, table {ti}, row {ri}: {[c[:50] for c in r]}")
 
                 # If col_map was detected for a different column count, try re-detecting
-                if col_map is not None and num_cols != col_map_num_cols:
+                # (skip re-detection if using a forced col_map from template)
+                if col_map is not None and num_cols != col_map_num_cols and not forced_col_map:
                     logger.info(f"Page {page_num}, table {ti}: col_map has {col_map_num_cols} cols but table has {num_cols} cols, re-detecting")
                     new_map = _detect_columns(cleaned, page)
                     if new_map:
@@ -800,7 +913,7 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                             logger.info(f"Page {page_num}, table {ti}: skipping table (re-detection failed, {num_cols} cols < needed {max_col_idx + 1})")
                             continue
 
-                # Detect column mapping once
+                # Detect column mapping once (skip if forced col_map from template)
                 if col_map is None:
                     # Need at least 3 rows (header + 2 data) to avoid collapsed tables
                     if len(cleaned) < 3:
@@ -824,6 +937,8 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                                     has_explicit_plus = True
                                     break
                         col_map["unsigned_is_debit"] = has_explicit_plus
+                elif forced_col_map and col_map_num_cols == 0:
+                    col_map_num_cols = num_cols
 
                 # Process ALL rows — no header skipping.
                 # _row_to_transaction() validates the date column; header rows
@@ -868,7 +983,7 @@ def _extract_from_tables(pdf_path: Path) -> list[dict]:
                     )
 
     logger.info(f"Strategy 1 (_extract_from_tables): total {len(transactions)} transactions extracted")
-    return transactions
+    return transactions, col_map
 
 
 def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) -> list[dict]:
@@ -1009,7 +1124,7 @@ def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) 
         return []
 
 
-def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
+def _extract_from_pymupdf(pdf_path: Path, forced_col_map: dict | None = None) -> list[dict]:
     """Extract transactions using PyMuPDF's visual table finder.
 
     PyMuPDF detects table row boundaries from the PDF's ruling lines and
@@ -1020,22 +1135,28 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
 
     The result is compared against pdfplumber's result in extract_transactions();
     whichever strategy finds more valid rows is used.
+
+    If forced_col_map is provided (from a saved template), column detection
+    is skipped and the saved mapping is used directly.
     """
     try:
         import fitz  # PyMuPDF  # noqa: PLC0415
     except ImportError:
         logger.debug("PyMuPDF not installed — skipping (pip install pymupdf)")
-        return []
+        return [], None
 
     transactions: list[dict] = []
-    col_map: dict | None = None
+    col_map: dict | None = forced_col_map
     col_map_num_cols = 0
 
     try:
         doc = fitz.open(str(pdf_path))
     except Exception as e:
         logger.warning(f"PyMuPDF could not open PDF: {e}")
-        return []
+        return [], None
+
+    if forced_col_map:
+        logger.info(f"PyMuPDF using forced col_map from template: {forced_col_map}")
 
     try:
         for page_num, page in enumerate(doc, 1):
@@ -1046,7 +1167,7 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
                     "PyMuPDF >= 1.23.0 required for find_tables(). "
                     "Upgrade: pip install --upgrade pymupdf"
                 )
-                return []
+                return [], None
 
             if not tabs.tables:
                 logger.debug(f"PyMuPDF page {page_num}: no tables found")
@@ -1068,7 +1189,8 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
                 )
 
                 # Re-detect columns when column count changes between pages
-                if col_map is not None and num_cols != col_map_num_cols:
+                # (skip re-detection if using a forced col_map from template)
+                if col_map is not None and num_cols != col_map_num_cols and not forced_col_map:
                     new_map = _detect_columns(cleaned, None)
                     if new_map:
                         col_map = new_map
@@ -1083,7 +1205,7 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
                                 if amt_idx < len(cleaned[r])
                             )
 
-                # First-time column detection
+                # First-time column detection (skip if forced col_map)
                 if col_map is None:
                     if len(cleaned) < 3:
                         logger.debug(
@@ -1107,6 +1229,8 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
                             for r in range(skip, min(skip + 30, len(cleaned)))
                             if amt_idx < len(cleaned[r])
                         )
+                elif forced_col_map and col_map_num_cols == 0:
+                    col_map_num_cols = num_cols
 
                 page_txn_count = 0
                 for ri, row in enumerate(cleaned):
@@ -1136,7 +1260,7 @@ def _extract_from_pymupdf(pdf_path: Path) -> list[dict]:
         doc.close()
 
     logger.info(f"PyMuPDF strategy: {len(transactions)} transactions extracted")
-    return transactions
+    return transactions, col_map
 
 
 def _detect_columns(table: list[list[str]], page=None) -> dict | None:
