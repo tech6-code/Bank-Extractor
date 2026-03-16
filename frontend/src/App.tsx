@@ -29,6 +29,26 @@ interface TemplateInfo {
   template_saved?: boolean;
 }
 
+interface ValidationMismatch {
+  row_index: number;
+  date: string;
+  description: string;
+  expected_balance: string;
+  actual_balance: string;
+  difference: string;
+}
+
+interface ValidationResult {
+  total_rows: number;
+  validated_rows: number;
+  valid_rows: number;
+  invalid_rows: number;
+  skipped_rows: number;
+  accuracy_pct: number;
+  direction: string;
+  mismatches: ValidationMismatch[];
+}
+
 interface ExtractResult {
   file_id: string;
   filename: string;
@@ -36,6 +56,7 @@ interface ExtractResult {
   transactions: Transaction[];
   total_rows: number;
   template?: TemplateInfo;
+  validation?: ValidationResult;
 }
 
 function App() {
@@ -55,6 +76,12 @@ function App() {
     const start = (page - 1) * ROWS_PER_PAGE;
     return result.transactions.slice(start, start + ROWS_PER_PAGE);
   }, [result, page]);
+
+  // Set of row indices that failed balance validation (for highlighting)
+  const mismatchRows = useMemo(() => {
+    if (!result?.validation?.mismatches) return new Set<number>();
+    return new Set(result.validation.mismatches.map((m) => m.row_index));
+  }, [result]);
 
   const stats = useMemo(() => {
     if (!result) return null;
@@ -288,7 +315,7 @@ function App() {
             )}
 
             {/* Stats bar */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <StatCard
                 label="Transactions"
                 value={result.total_rows.toLocaleString()}
@@ -320,6 +347,41 @@ function App() {
                   </svg>
                 }
               />
+              {/* Balance Validation Card */}
+              {result.validation && result.validation.validated_rows > 0 ? (
+                <StatCard
+                  label="Balance Check"
+                  value={`${result.validation.accuracy_pct}%`}
+                  sub={
+                    result.validation.invalid_rows > 0
+                      ? `${result.validation.invalid_rows} mismatch${result.validation.invalid_rows > 1 ? "es" : ""}`
+                      : `${result.validation.valid_rows} verified`
+                  }
+                  color={
+                    result.validation.accuracy_pct >= 95
+                      ? "green"
+                      : result.validation.accuracy_pct >= 80
+                        ? "yellow"
+                        : "red"
+                  }
+                  icon={
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
+                    </svg>
+                  }
+                />
+              ) : (
+                <StatCard
+                  label="Balance Check"
+                  value="N/A"
+                  sub="No balance data"
+                  icon={
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75m-3-7.036A11.959 11.959 0 0 1 3.598 6 11.99 11.99 0 0 0 3 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285Z" />
+                    </svg>
+                  }
+                />
+              )}
               <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4 flex flex-col justify-between">
                 <div className="flex items-center gap-2 mb-3">
                   <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-indigo-500/10">
@@ -365,32 +427,44 @@ function App() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {paginatedRows.map((txn, i) => (
-                      <TableRow
-                        key={`${txn.date}-${txn.balance}-${i}`}
-                        className="border-white/[0.03] hover:bg-white/[0.02] transition-colors"
-                      >
-                        <TableCell className="whitespace-nowrap text-white/50 text-sm font-mono pl-5">
-                          {txn.date}
-                        </TableCell>
-                        <TableCell className="max-w-md text-sm text-white/70">
-                          <span className="truncate block">{txn.description}</span>
-                        </TableCell>
-                        <TableCell className="text-right whitespace-nowrap text-sm font-mono">
-                          {txn.debit && (
-                            <span className="text-red-400">{txn.debit}</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right whitespace-nowrap text-sm font-mono">
-                          {txn.credit && (
-                            <span className="text-emerald-400">{txn.credit}</span>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right whitespace-nowrap text-sm font-mono text-white/60 pr-5">
-                          {txn.balance}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                    {paginatedRows.map((txn, i) => {
+                      const globalIdx = (page - 1) * ROWS_PER_PAGE + i;
+                      const isMismatch = mismatchRows.has(globalIdx);
+                      return (
+                        <TableRow
+                          key={`${txn.date}-${txn.balance}-${i}`}
+                          className={`border-white/[0.03] hover:bg-white/[0.02] transition-colors ${
+                            isMismatch ? "border-l-2 border-l-amber-500/60 bg-amber-500/[0.03]" : ""
+                          }`}
+                          title={isMismatch ? "Balance mismatch detected" : undefined}
+                        >
+                          <TableCell className="whitespace-nowrap text-white/50 text-sm font-mono pl-5">
+                            {isMismatch && (
+                              <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 mr-2 shrink-0" />
+                            )}
+                            {txn.date}
+                          </TableCell>
+                          <TableCell className="max-w-md text-sm text-white/70">
+                            <span className="truncate block">{txn.description}</span>
+                          </TableCell>
+                          <TableCell className="text-right whitespace-nowrap text-sm font-mono">
+                            {txn.debit && (
+                              <span className="text-red-400">{txn.debit}</span>
+                            )}
+                          </TableCell>
+                          <TableCell className="text-right whitespace-nowrap text-sm font-mono">
+                            {txn.credit && (
+                              <span className="text-emerald-400">{txn.credit}</span>
+                            )}
+                          </TableCell>
+                          <TableCell className={`text-right whitespace-nowrap text-sm font-mono pr-5 ${
+                            isMismatch ? "text-amber-400" : "text-white/60"
+                          }`}>
+                            {txn.balance}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
@@ -477,7 +551,7 @@ function StatCard({
   label: string;
   value: string;
   sub?: string;
-  color?: "red" | "green";
+  color?: "red" | "green" | "yellow";
   icon: React.ReactNode;
 }) {
   const colorMap = {
@@ -490,6 +564,11 @@ function StatCard({
       iconBg: "bg-emerald-500/10",
       iconText: "text-emerald-400",
       valueText: "text-emerald-400",
+    },
+    yellow: {
+      iconBg: "bg-amber-500/10",
+      iconText: "text-amber-400",
+      valueText: "text-amber-400",
     },
   };
 

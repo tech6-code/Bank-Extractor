@@ -21,6 +21,7 @@ import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
 from extractor.template_engine import match_template, save_extraction_template
+from extractor.balance_validator import validate_balances
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -112,6 +113,7 @@ async def extract_preview(file: UploadFile):
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(413, f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)} MB.")
+    TEMP_DIR.mkdir(exist_ok=True)
     pdf_path.write_bytes(content)
 
     try:
@@ -164,6 +166,13 @@ async def extract_preview(file: UploadFile):
             except Exception as e:
                 logger.warning(f"Template saving failed (non-critical): {e}")
 
+    # ── Balance validation ───────────────────────────────────────────────
+    validation = {}
+    try:
+        validation = validate_balances(transactions)
+    except Exception as e:
+        logger.warning(f"Balance validation failed (non-critical): {e}")
+
     _cache_put(file_id, transactions)
 
     return {
@@ -173,6 +182,7 @@ async def extract_preview(file: UploadFile):
         "transactions": transactions,
         "total_rows": len(transactions),
         "template": template_info,
+        "validation": validation,
     }
 
 

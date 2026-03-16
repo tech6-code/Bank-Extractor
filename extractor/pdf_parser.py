@@ -982,6 +982,316 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                         f"{[m['date'] + ' ' + m['description'][:30] for m in missed]}"
                     )
 
+    # ── Second-pass fallback: if default strategy found nothing, retry all
+    # pages with text-based column detection.  Some PDFs (e.g. Wio Bank)
+    # have zero ruling lines — every page returns a single-column table
+    # under the default "lines" strategy, so col_map is never detected.
+    # The text strategy uses character positions to infer column boundaries.
+    if not transactions and not forced_col_map:
+        logger.info("Default strategy found 0 transactions, retrying all pages with text strategy")
+
+        # Step 1: Find a page where we can detect column headers and build
+        # explicit vertical lines from header word x-positions.  This avoids
+        # the over-segmentation problem where the text strategy creates too
+        # many columns on pages with mixed layouts (headers, account info, etc.).
+        explicit_lines: list[float] | None = None
+        header_page_width: float = 0
+
+        best_score = 0
+        best_roles: list = []
+        best_words: list = []
+        best_page_width: float = 0
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words:
+                    continue
+                # Group words by y-position to find header lines.
+                # Merge lines within 5px of each other (some PDFs have
+                # headers like "Fees" at y=263 and "Date" at y=266).
+                lines_by_top: dict[int, list] = defaultdict(list)
+                for w in words:
+                    lines_by_top[round(w["top"])].append(w)
+
+                # Merge nearby y-lines into bands
+                sorted_tops = sorted(lines_by_top.keys())
+                merged_lines: list[list] = []
+                for top in sorted_tops:
+                    if merged_lines and abs(top - merged_lines[-1][0][0]) <= 5:
+                        # Merge with previous band (use min top as reference)
+                        merged_lines[-1].extend(
+                            (top, w) for w in lines_by_top[top]
+                        )
+                    else:
+                        merged_lines.append(
+                            [(top, w) for w in lines_by_top[top]]
+                        )
+
+                for band in merged_lines:
+                    all_words_in_band = [w for _, w in band]
+                    sorted_lw = sorted(all_words_in_band, key=lambda w: w["x0"])
+                    score, col_roles = _score_header_line(sorted_lw)
+                    if score <= best_score:
+                        continue
+                    # Prefer lines with diverse roles (date+desc+amount)
+                    # over lines with duplicate roles (balance+balance)
+                    unique_roles = {r for r, _ in col_roles if r not in ("skip", "unknown")}
+                    has_date = "date" in unique_roles
+                    has_amount = bool(unique_roles & {"debit", "credit", "balance", "amount"})
+                    if has_date and has_amount:
+                        best_score = score
+                        best_roles = col_roles
+                        best_words = sorted_lw
+                        best_page_width = page.width
+
+        if best_score >= 2 and best_words:
+            # Use ALL header word positions as column boundaries,
+            # not just the classified ones — unrecognized columns
+            # like "Fees" still need boundaries for proper separation.
+            # Group nearby words (within 15px) as one column.
+            # Shift each boundary 3pt left so text starting at the
+            # boundary is included in the column (pdfplumber is strict
+            # about left-edge alignment).
+            x_positions = []
+            for w in best_words:
+                x0 = max(0, w["x0"] - 3)
+                if not x_positions or abs(x0 - x_positions[-1]) > 15:
+                    x_positions.append(x0)
+            x_positions.sort()
+            x_positions.append(best_page_width)
+            explicit_lines = x_positions
+            header_page_width = best_page_width
+            logger.info(
+                f"Text strategy: best header line score={best_score}, "
+                f"explicit_lines={[round(x, 1) for x in explicit_lines]}"
+            )
+
+        # Step 2: Two-pass approach.
+        # Pass 1: Find col_map from the best page (one with recognizable headers).
+        #         Pages with mixed content (account info + data) may fail detection.
+        # Pass 2: Extract transactions from ALL pages using the detected col_map.
+        col_map = None
+        col_map_num_cols = 0
+
+        with pdfplumber.open(pdf_path) as pdf:
+            # ── Pass 1: detect col_map ────────────────────────────────────
+            for page_num, page in enumerate(pdf.pages, 1):
+                text_tables = page.extract_tables({
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                })
+                if not text_tables:
+                    continue
+
+                for table in text_tables:
+                    cleaned = _clean_table(table)
+                    if not cleaned or len(cleaned) < 3:
+                        continue
+                    candidate = _detect_columns(cleaned, page)
+                    if candidate:
+                        has_financial = any(
+                            k in candidate for k in ("debit", "credit", "balance", "amount")
+                        )
+                        if has_financial:
+                            col_map = candidate
+                            col_map_num_cols = len(cleaned[0])
+                            logger.info(
+                                f"Text strategy pass 1: col_map detected on page {page_num} "
+                                f"({col_map_num_cols} cols): {col_map}"
+                            )
+                            break
+                if col_map:
+                    break
+
+            if not col_map:
+                logger.info("Text strategy pass 1: no col_map detected on any page")
+
+            # ── Pass 2: extract transactions from all pages ───────────────
+            if col_map:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    text_tables = page.extract_tables({
+                        "vertical_strategy": "text",
+                        "horizontal_strategy": "text",
+                    })
+                    if not text_tables:
+                        continue
+
+                    multi_col_tables = [t for t in text_tables if t and len(t[0]) > 1]
+                    if not multi_col_tables:
+                        continue
+
+                    for ti, table in enumerate(multi_col_tables):
+                        cleaned = _clean_table(table)
+                        if not cleaned:
+                            continue
+
+                        num_cols = len(cleaned[0])
+
+                        # If column count differs, try re-detecting for this page
+                        page_col_map = col_map
+                        if num_cols != col_map_num_cols:
+                            new_map = _detect_columns(cleaned, page)
+                            if new_map:
+                                page_col_map = new_map
+                            else:
+                                # Can't detect — still try with original col_map
+                                # if the table has enough columns
+                                max_idx = max(v for k, v in col_map.items() if isinstance(v, int))
+                                if num_cols <= max_idx:
+                                    continue
+
+                        for row in cleaned:
+                            txn = _row_to_transaction(row, page_col_map)
+                            if txn:
+                                transactions.append(txn)
+
+        # ── Pre-pass-3 validation: check pass 2 results quality ─────────
+        # If most transactions from pass 2 have no debit/credit (amounts
+        # only in balance column or missing), the column mapping is wrong.
+        # Discard and let Strategy 2/3 handle it.
+        if transactions and col_map:
+            no_dc = sum(1 for t in transactions if not t.get("debit") and not t.get("credit"))
+            if len(transactions) > 0 and no_dc / len(transactions) > 0.7:
+                logger.warning(
+                    f"Text strategy pass 2: {no_dc}/{len(transactions)} transactions "
+                    f"have no debit/credit — discarding results"
+                )
+                transactions = []
+                col_map = None
+
+        # ── Pass 3: Recover transactions from pages that the text strategy
+        # couldn't parse due to mixed content (account info + data).
+        # Detect which pages were missed by checking if their date-containing
+        # rows produced any transactions, then retry those pages using word-
+        # position extraction with the known col_map's column roles.
+        if transactions and col_map:
+            captured_dates = {(t["date"], t["description"][:20]) for t in transactions}
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    # Quick check: does this page have date-like text?
+                    text = page.extract_text()
+                    if not text:
+                        continue
+                    page_dates = set()
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if DATE_START_RE.match(line):
+                            for p in DATE_PATTERNS:
+                                dm = p.match(line)
+                                if dm:
+                                    page_dates.add(dm.group(1))
+                                    break
+                    if not page_dates:
+                        continue
+
+                    # Check if any of this page's dates are NOT in captured transactions
+                    page_txn_count = sum(
+                        1 for d, desc in captured_dates if d in page_dates
+                    )
+                    if page_txn_count >= len(page_dates) * 0.5:
+                        continue  # Most dates from this page are already captured
+
+                    # This page was likely missed — try word-position recovery
+                    logger.info(
+                        f"Text strategy pass 3: page {page_num} appears to have "
+                        f"uncaptured transactions ({len(page_dates)} dates, "
+                        f"{page_txn_count} captured), attempting word-position recovery"
+                    )
+                    # Use _extract_from_text strategy for just this page's text
+                    prev_balance = None
+                    for line in text.split("\n"):
+                        line = line.strip()
+                        if not line or _is_noise_line(line):
+                            continue
+                        txn = _parse_text_line(line, prev_balance)
+                        if txn:
+                            key = (txn["date"], txn["description"][:20])
+                            if key not in captured_dates:
+                                transactions.append(txn)
+                                captured_dates.add(key)
+                                if txn["balance"]:
+                                    try:
+                                        prev_balance = float(
+                                            txn["balance"].replace(",", "")
+                                        )
+                                    except ValueError:
+                                        pass
+
+        if transactions and col_map:
+            # Validate: financial columns (debit/credit) must actually contain
+            # monetary values (numbers with decimals).  If they look like plain
+            # integers (e.g. reference numbers), the column mapping is wrong
+            # and the results are unreliable — discard and let Strategy 2/3
+            # handle it.
+            discard = False
+            for fin_key in ("debit", "credit"):
+                if fin_key not in col_map or not isinstance(col_map[fin_key], int):
+                    continue
+                # Check if the majority of values in this column are plain integers
+                col_idx = col_map[fin_key]
+                plain_int_count = 0
+                value_count = 0
+                for txn in transactions[:20]:
+                    val = txn.get(fin_key, "").strip()
+                    if not val:
+                        continue
+                    value_count += 1
+                    cleaned_val = val.replace(",", "").replace("-", "")
+                    if cleaned_val.isdigit() and len(cleaned_val) >= 5:
+                        # 5+ digit integer with no decimal → likely a ref number
+                        plain_int_count += 1
+                if value_count > 0 and plain_int_count / value_count > 0.5:
+                    logger.warning(
+                        f"Text strategy fallback: '{fin_key}' column appears to contain "
+                        f"reference numbers, not monetary amounts ({plain_int_count}/{value_count} "
+                        f"are 5+ digit integers) — discarding results"
+                    )
+                    discard = True
+                    break
+
+            # Also check: if most transactions have NO debit/credit
+            # (all amounts only in balance column), the columns are misaligned.
+            if not discard:
+                no_debit_credit = 0
+                sample = transactions[:30]
+                for txn in sample:
+                    if not txn.get("debit") and not txn.get("credit"):
+                        no_debit_credit += 1
+                if len(sample) > 0 and no_debit_credit / len(sample) > 0.7:
+                    logger.warning(
+                        f"Text strategy fallback: {no_debit_credit}/{len(sample)} "
+                        f"transactions have no debit/credit — discarding results"
+                    )
+                    discard = True
+
+            # Also check: if most "date" values contain extra text beyond
+            # the date (e.g. "02/01/2024 27155127"), the table columns are
+            # misaligned (date+ref merged into one column).
+            if not discard:
+                bad_date_count = 0
+                date_sample = 0
+                for txn in transactions[:30]:
+                    d = txn.get("date", "").strip()
+                    if d:
+                        date_sample += 1
+                        # A clean date should be <= 12 chars (e.g. "31/12/2024")
+                        if len(d) > 12:
+                            bad_date_count += 1
+                if date_sample > 0 and bad_date_count / date_sample > 0.5:
+                    logger.warning(
+                        f"Text strategy fallback: date column contains extra text "
+                        f"({bad_date_count}/{date_sample} dates > 12 chars) — "
+                        f"discarding results"
+                    )
+                    discard = True
+
+            if not discard:
+                logger.info(f"Text strategy fallback: {len(transactions)} transactions extracted")
+            else:
+                transactions = []
+                col_map = None
+
     logger.info(f"Strategy 1 (_extract_from_tables): total {len(transactions)} transactions extracted")
     return transactions, col_map
 
@@ -1891,8 +2201,11 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
 
                 txn = _parse_text_line(line, prev_balance)
                 if txn:
-                    # Prepend accumulated description lines
-                    if pending_desc_lines:
+                    # Prepend accumulated description lines (but only if we've
+                    # already seen at least one transaction — lines before the
+                    # first transaction are page headers / account info, not
+                    # description continuations)
+                    if pending_desc_lines and transactions:
                         pre_desc = " ".join(pending_desc_lines)
                         if txn["description"]:
                             txn["description"] = pre_desc + " " + txn["description"]
@@ -1988,6 +2301,24 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     if not trailing_amounts:
         return None
 
+    # Filter out small plain integers from the leading edge of the trailing
+    # cluster — they're likely part of the description (e.g. "SITE 48",
+    # "FLOOR 3", "REF 12345").  Keep only amounts that look monetary:
+    # have a decimal point, have commas, are negative, or are large (>= 1000).
+    while len(trailing_amounts) > 1:
+        first_val = trailing_amounts[0].group(1).replace(",", "")
+        has_decimal = "." in first_val
+        is_negative = first_val.startswith("-")
+        is_large = abs(float(first_val)) >= 1000 if first_val.replace("-", "").replace(".", "").isdigit() else False
+        if not has_decimal and not is_negative and not is_large:
+            # Small plain integer — likely part of description, not an amount
+            trailing_amounts.pop(0)
+        else:
+            break
+
+    if not trailing_amounts:
+        return None
+
     # Description is everything before the trailing amounts
     desc_end = trailing_amounts[0].start()
     description = rest[:desc_end].strip()
@@ -2000,9 +2331,21 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
         if val < 0:
             return {"date": date, "description": description,
                     "debit": f"{abs(val):,.2f}", "credit": "", "balance": ""}
+        elif prev_balance is not None:
+            # With a previous balance, we can infer: if this positive amount
+            # would make sense as a new balance (close to prev_balance), treat
+            # it as a balance.  Otherwise treat it as a credit amount.
+            # Heuristic: if it's within 2x of prev_balance, likely a balance.
+            if prev_balance > 0 and 0.1 * prev_balance <= val <= 10 * prev_balance:
+                return {"date": date, "description": description,
+                        "debit": "", "credit": "", "balance": f"{val:,.2f}"}
+            else:
+                return {"date": date, "description": description,
+                        "debit": "", "credit": f"{val:,.2f}", "balance": ""}
         else:
+            # No previous balance — positive single amount is credit
             return {"date": date, "description": description,
-                    "debit": "", "credit": "", "balance": f"{val:,.2f}"}
+                    "debit": "", "credit": f"{val:,.2f}", "balance": ""}
 
     # Last = balance, second-to-last = amount
     balance_str = amount_strs[-1]

@@ -72,8 +72,13 @@ def extract_layout_info(pdf_path: str | Path) -> Optional[dict]:
     if layout:
         return layout
 
-    # Fallback to pdfplumber
+    # Fallback to pdfplumber (lines strategy)
     layout = _extract_layout_pdfplumber(pdf_path)
+    if layout:
+        return layout
+
+    # Last resort: pdfplumber text strategy (for PDFs with no ruling lines)
+    layout = _extract_layout_pdfplumber_text(pdf_path)
     if layout:
         return layout
 
@@ -232,6 +237,93 @@ def _extract_layout_pdfplumber(pdf_path: str | Path) -> Optional[dict]:
             }
     except Exception as e:
         logger.debug("pdfplumber layout extraction failed: %s", e)
+        return None
+
+
+def _extract_layout_pdfplumber_text(pdf_path: str | Path) -> Optional[dict]:
+    """Extract layout info using pdfplumber text strategy.
+
+    For PDFs with no ruling lines (e.g. Wio Bank), the default pdfplumber
+    strategy fails. This uses the text strategy which detects column
+    boundaries from character positions. Scans all pages to find one
+    with recognizable column headers.
+    """
+    import pdfplumber
+    from collections import defaultdict
+
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            if not pdf.pages:
+                return None
+
+            page_width = pdf.pages[0].width
+            page_height = pdf.pages[0].height
+
+            # Scan pages to find column headers from word positions
+            for page in pdf.pages[:5]:
+                words = page.extract_words()
+                if not words:
+                    continue
+
+                # Group words by y-position, merge nearby lines
+                lines_by_top: dict[int, list] = defaultdict(list)
+                for w in words:
+                    lines_by_top[round(w["top"])].append(w)
+
+                sorted_tops = sorted(lines_by_top.keys())
+                merged_bands: list[list] = []
+                for top in sorted_tops:
+                    if merged_bands and abs(top - merged_bands[-1][0][0]) <= 5:
+                        merged_bands[-1].extend(
+                            [(top, w) for w in lines_by_top[top]]
+                        )
+                    else:
+                        merged_bands.append(
+                            [(top, w) for w in lines_by_top[top]]
+                        )
+
+                # Import scoring function
+                from extractor.pdf_parser import _score_header_line, classify_column_header
+
+                for band in merged_bands:
+                    all_words = [w for _, w in band]
+                    sorted_lw = sorted(all_words, key=lambda w: w["x0"])
+                    score, col_roles = _score_header_line(sorted_lw)
+
+                    if score < 2:
+                        continue
+
+                    unique_roles = {r for r, _ in col_roles if r not in ("skip", "unknown")}
+                    if "date" not in unique_roles:
+                        continue
+
+                    # Build header texts from word positions (group nearby)
+                    header_texts = []
+                    header_x_positions = []
+                    for w in sorted_lw:
+                        if not header_x_positions or abs(w["x0"] - header_x_positions[-1]) > 15:
+                            header_texts.append(w["text"])
+                            header_x_positions.append(w["x0"])
+                        else:
+                            # Merge with previous (e.g. "Ref." + "Number")
+                            header_texts[-1] += " " + w["text"]
+
+                    if len(header_texts) < 3:
+                        continue
+
+                    return {
+                        "header_texts": header_texts,
+                        "header_x_positions": header_x_positions,
+                        "column_count": len(header_texts),
+                        "page_width": page_width,
+                        "page_height": page_height,
+                        "header_row_index": 0,
+                        "source": "pdfplumber_text",
+                    }
+
+        return None
+    except Exception as e:
+        logger.debug("pdfplumber text layout extraction failed: %s", e)
         return None
 
 
