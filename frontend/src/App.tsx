@@ -47,6 +47,7 @@ interface ValidationResult {
   accuracy_pct: number;
   direction: string;
   mismatches: ValidationMismatch[];
+  row_variances?: Record<string, number>;
 }
 
 interface ExtractResult {
@@ -423,7 +424,10 @@ function App() {
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider">Description</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Debit</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Credit</TableHead>
-                      <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right pr-5">Balance</TableHead>
+                      <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Balance</TableHead>
+                      {result.validation?.row_variances && (
+                        <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right pr-5">Variance</TableHead>
+                      )}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -457,11 +461,27 @@ function App() {
                               <span className="text-emerald-400">{txn.credit}</span>
                             )}
                           </TableCell>
-                          <TableCell className={`text-right whitespace-nowrap text-sm font-mono pr-5 ${
-                            isMismatch ? "text-amber-400" : "text-white/60"
-                          }`}>
+                          <TableCell className={`text-right whitespace-nowrap text-sm font-mono ${
+                            !result.validation?.row_variances ? "pr-5" : ""
+                          } ${isMismatch ? "text-amber-400" : "text-white/60"}`}>
                             {txn.balance}
                           </TableCell>
+                          {result.validation?.row_variances && (() => {
+                            const variance = result.validation.row_variances?.[globalIdx];
+                            const hasVariance = variance !== undefined;
+                            const isZero = hasVariance && variance === 0;
+                            return (
+                              <TableCell className={`text-right whitespace-nowrap text-sm font-mono pr-5 ${
+                                !hasVariance ? "text-white/20" :
+                                isZero ? "text-emerald-400/70" :
+                                "text-red-400"
+                              }`}>
+                                {!hasVariance ? "-" :
+                                 isZero ? "0" :
+                                 (variance > 0 ? "+" : "") + variance.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
+                              </TableCell>
+                            );
+                          })()}
                         </TableRow>
                       );
                     })}

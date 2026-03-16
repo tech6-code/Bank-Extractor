@@ -882,9 +882,13 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                     for ri, r in enumerate(cleaned):
                         logger.info(f"  Page {page_num}, table {ti}, row {ri}: {[c[:50] for c in r]}")
 
-                # If col_map was detected for a different column count, try re-detecting
-                # (skip re-detection if using a forced col_map from template)
-                if col_map is not None and num_cols != col_map_num_cols and not forced_col_map:
+                # If col_map was detected for a different column count, try re-detecting.
+                # Even forced col_maps from templates must be re-detected when the
+                # table has FEWER columns — using out-of-range indices would shift
+                # debit/credit/balance into wrong columns.
+                if col_map is not None and num_cols != col_map_num_cols and (
+                    not forced_col_map or num_cols < col_map_num_cols
+                ):
                     logger.info(f"Page {page_num}, table {ti}: col_map has {col_map_num_cols} cols but table has {num_cols} cols, re-detecting")
                     new_map = _detect_columns(cleaned, page)
                     if new_map:
@@ -905,13 +909,20 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                     else:
                         # Re-detection failed. If the table has MORE cols than col_map needs,
                         # still try processing with existing col_map (columns may just be offset).
-                        # If fewer cols, skip — the existing col_map indices would be out of range.
+                        # If fewer cols, try content-based inference before skipping.
                         max_col_idx = max(v for k, v in col_map.items() if isinstance(v, int))
                         if num_cols > max_col_idx:
                             logger.info(f"Page {page_num}, table {ti}: re-detection failed but table has enough cols ({num_cols} > max_idx {max_col_idx}), trying existing col_map")
                         else:
-                            logger.info(f"Page {page_num}, table {ti}: skipping table (re-detection failed, {num_cols} cols < needed {max_col_idx + 1})")
-                            continue
+                            # Try content-based inference as last resort
+                            inferred = _infer_columns_by_content(cleaned)
+                            if inferred:
+                                col_map = inferred
+                                col_map_num_cols = num_cols
+                                logger.info(f"Page {page_num}, table {ti}: content-inferred col_map: {col_map}")
+                            else:
+                                logger.info(f"Page {page_num}, table {ti}: skipping table (re-detection failed, {num_cols} cols < needed {max_col_idx + 1})")
+                                continue
 
                 # Detect column mapping once (skip if forced col_map from template)
                 if col_map is None:
@@ -945,7 +956,11 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                 # (containing "Date" / "التاريخ" instead of an actual date) are
                 # rejected by the date-pattern check and return None.
                 # This eliminates false skips of first-row data on every page.
+                #
+                # Continuation rows (no date, only description text) are merged
+                # into the previous transaction's description.
                 page_txn_count = 0
+                desc_idx = col_map.get("description")
                 for ri, row in enumerate(cleaned):
                     txn = _row_to_transaction(row, col_map)
                     if txn:
@@ -963,6 +978,22 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                         if page_txn_count <= 3:
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: EXTRACTED txn #{len(transactions)}: date={txn['date']}, desc={txn['description'][:50]!r}, debit={txn['debit']}, credit={txn['credit']}, balance={txn['balance']}")
                     else:
+                        # Check if this is a continuation row (no date but has description text).
+                        # Merge its description into the previous transaction.
+                        if (
+                            transactions
+                            and desc_idx is not None
+                            and isinstance(desc_idx, int)
+                            and desc_idx < len(row)
+                        ):
+                            continuation_text = row[desc_idx].strip()
+                            if continuation_text and len(continuation_text) > 1:
+                                # Verify this row has no date (first col is empty or non-date)
+                                date_idx = col_map.get("date", 0)
+                                date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
+                                if not date_cell:
+                                    transactions[-1]["description"] += "/" + continuation_text
+
                         # Log first few rejected rows per page too
                         if ri < 3:
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: REJECTED (returned None), row={[c[:40] for c in row]}")
@@ -1708,9 +1739,13 @@ def _infer_columns_by_content(table: list[list[str]]) -> dict | None:
                 text_scores[i] += 1
 
     # Find the FIRST date column (transaction date, not value date)
+    # Threshold: at least 2 dates, and at least 15% of non-empty rows
+    # (lower than 30% because continuation rows inflate the empty count)
     date_col = None
     for i in range(num_cols):
-        if date_scores[i] >= max(2, total_sampled * 0.3):
+        non_empty_rows = total_sampled - empty_scores[i]
+        date_pct = date_scores[i] / non_empty_rows if non_empty_rows > 0 else 0
+        if date_scores[i] >= 2 and date_pct >= 0.5:
             date_col = i
             break
 
@@ -1760,10 +1795,24 @@ def _infer_columns_by_content(table: list[list[str]]) -> dict | None:
     if len(amount_cols) == 1:
         col_map["balance"] = amount_cols[0]
     elif len(amount_cols) == 2:
-        # Could be debit+balance or debit+credit — check if one has many empties
+        # Could be debit+balance, debit+credit, or amount+balance
         e0 = empty_scores[amount_cols[0]]
         e1 = empty_scores[amount_cols[1]]
-        if e0 > total_sampled * 0.3 or e1 > total_sampled * 0.3:
+
+        # Check if first col has negative values (signed amount column)
+        has_negatives = False
+        for row in sample_rows:
+            if amount_cols[0] < len(row):
+                val = row[amount_cols[0]].strip()
+                if val.startswith("-"):
+                    has_negatives = True
+                    break
+
+        if has_negatives:
+            # Signed amount + balance (e.g. Wio Bank, or Sharjah page 10)
+            col_map["amount"] = amount_cols[0]
+            col_map["balance"] = amount_cols[1]
+        elif e0 > total_sampled * 0.3 or e1 > total_sampled * 0.3:
             # Looks like debit/credit (one is often empty)
             col_map["debit"] = amount_cols[0]
             col_map["credit"] = amount_cols[1]
@@ -1888,7 +1937,7 @@ def _split_signed_amount(raw: str, unsigned_is_debit: bool = False) -> tuple[str
     if is_credit:
         return "", cleaned
     elif is_debit:
-        return cleaned, ""
+        return "-" + cleaned, ""
     else:
         # No explicit sign — convention-dependent
         if unsigned_is_debit:

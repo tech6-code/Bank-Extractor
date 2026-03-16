@@ -52,7 +52,11 @@ def _validate_in_order(transactions: list[dict], direction: str) -> dict:
     skipped = 0
     prev_balance: Optional[float] = None
 
+    # Per-row variance keyed by original transaction index
+    row_variances: dict[int, float] = {}
+
     for i, txn in enumerate(ordered):
+        original_idx = i if direction == "ascending" else (total - 1 - i)
         bal = _parse_amount(txn.get("balance", ""))
 
         if bal is None:
@@ -63,6 +67,7 @@ def _validate_in_order(transactions: list[dict], direction: str) -> dict:
             # First row with a balance — can't validate, just record it
             prev_balance = bal
             skipped += 1
+            row_variances[original_idx] = 0.0
             continue
 
         # Parse debit and credit
@@ -74,21 +79,23 @@ def _validate_in_order(transactions: list[dict], direction: str) -> dict:
 
         expected = round(prev_balance - debit_val + credit_val, 2)
         actual = round(bal, 2)
+        difference = round(actual - expected, 2)
 
         validated += 1
 
-        if abs(expected - actual) <= TOLERANCE:
+        # Store variance for this row (0.0 if within tolerance)
+        if abs(difference) <= TOLERANCE:
             valid += 1
+            row_variances[original_idx] = 0.0
         else:
-            # Map back to original index in the transaction list
-            original_idx = i if direction == "ascending" else (total - 1 - i)
+            row_variances[original_idx] = difference
             mismatches.append({
                 "row_index": original_idx,
                 "date": txn.get("date", ""),
                 "description": txn.get("description", "")[:60],
                 "expected_balance": f"{expected:,.2f}",
                 "actual_balance": txn.get("balance", ""),
-                "difference": f"{abs(expected - actual):,.2f}",
+                "difference": f"{abs(difference):,.2f}",
             })
 
         prev_balance = bal
@@ -104,6 +111,7 @@ def _validate_in_order(transactions: list[dict], direction: str) -> dict:
         "accuracy_pct": accuracy,
         "direction": direction,
         "mismatches": mismatches,
+        "row_variances": row_variances,
     }
 
 
@@ -164,4 +172,5 @@ def _empty_result() -> dict:
         "accuracy_pct": 0.0,
         "direction": "unknown",
         "mismatches": [],
+        "row_variances": {},
     }
