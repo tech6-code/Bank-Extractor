@@ -298,7 +298,7 @@ function App() {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v6m3-3H9m12 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
                     </svg>
                     <span className="text-xs text-blue-300 font-medium">
-                      New template saved
+                      New template saved{result.template.template_bank_name ? `: ${result.template.template_bank_name}` : ""}
                     </span>
                     <Badge variant="secondary" className="bg-blue-500/10 text-blue-400 border-0 text-[10px] uppercase">
                       {result.template.strategy}

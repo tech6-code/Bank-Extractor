@@ -20,7 +20,7 @@ from starlette.background import BackgroundTask
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
-from extractor.template_engine import match_template, save_extraction_template
+from extractor.template_engine import match_template, save_extraction_template, detect_bank_name
 from extractor.balance_validator import validate_balances
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -162,7 +162,11 @@ async def extract_preview(file: UploadFile):
                 if template_id:
                     template_info["template_id"] = template_id
                     template_info["template_saved"] = True
-                    logger.info(f"New template saved (id={template_id})")
+                    # Detect bank name for the response
+                    bank_name = detect_bank_name(str(pdf_path))
+                    if bank_name:
+                        template_info["template_bank_name"] = bank_name
+                    logger.info(f"New template saved (id={template_id}, bank={bank_name or 'unknown'})")
             except Exception as e:
                 logger.warning(f"Template saving failed (non-critical): {e}")
 

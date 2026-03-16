@@ -373,6 +373,117 @@ def match_template(pdf_path: str | Path) -> Optional[dict]:
     return None
 
 
+# ─── Bank Name Detection ─────────────────────────────────────────────────────
+
+# Ordered longest-first so "first abu dhabi bank" matches before "fab"
+# Uses word-boundary matching (\b) to avoid false positives like "adcb" in "CCDM"
+_KNOWN_BANKS = [
+    ("sharjah islamic bank", "Sharjah Islamic Bank"),
+    ("abu dhabi commercial bank", "ADCB"),
+    ("abu dhabi islamic bank", "ADIB"),
+    ("first abu dhabi bank", "FAB"),
+    ("national bank of ras al khaimah", "RAK Bank"),
+    ("commercial bank of dubai", "CBD"),
+    ("emirates islamic bank", "Emirates Islamic Bank"),
+    ("emirates nbd", "Emirates NBD"),
+    ("dubai islamic bank", "DIB"),
+    ("standard chartered", "Standard Chartered"),
+    ("mashreqbank", "Mashreq Bank"),
+    ("mashreq bank", "Mashreq Bank"),
+    ("wio business", "Wio Bank"),
+    ("wio bank", "Wio Bank"),
+    ("rak bank", "RAK Bank"),
+    ("rakbank", "RAK Bank"),
+    ("banque misr", "Banque Misr"),
+    ("habib bank", "HBL"),
+    ("absa bank", "ABSA Bank"),
+    ("ajman bank pjsc", "Ajman Bank"),
+    ("ajman bank p.j.s.c", "Ajman Bank"),
+    ("invest bank", "Invest Bank"),
+    ("united bank", "United Bank Limited"),
+    ("arab bank", "Arab Bank"),
+    ("noqodi", "Noqodi (e-Cash)"),
+    ("citibank", "Citibank"),
+    ("hsbc", "HSBC"),
+]
+
+# Short abbreviations that need word-boundary matching to avoid false positives
+_KNOWN_BANKS_WORD_BOUNDARY = [
+    ("adcb", "ADCB"),
+    ("adib", "ADIB"),
+    ("enbd", "Emirates NBD"),
+    ("hbl", "HBL"),
+    ("cbd", "CBD"),
+    ("dib", "DIB"),
+    ("fab", "FAB"),
+    ("liv", "LIV (ENBD Digital)"),
+]
+
+# IBAN prefix → bank (fallback when text detection fails)
+# UAE IBANs: AExx BBBB ... where BBBB is the bank code (Swift/BIC-derived)
+_IBAN_BANK_CODES = {
+    "0030": "ADCB",  # ADCB (formerly NBF, merged with FAB)
+    "0090": "DIB",
+    "0230": "CBD",
+    "0240": "Mashreq Bank",
+    "0250": "FAB",
+    "0260": "Emirates NBD",
+    "0340": "RAK Bank",
+    "0350": "ADCB",
+    "0400": "ADIB",
+    "0410": "Sharjah Islamic Bank",
+    "0440": "HBL",
+    "0500": "Ajman Bank",
+    "0860": "Wio Bank",
+}
+
+
+def detect_bank_name(pdf_path: str | Path) -> Optional[str]:
+    """Detect the bank name from the first 2 pages of a PDF.
+
+    Uses three methods in order:
+    1. Full-phrase text matching (e.g. "sharjah islamic bank")
+    2. Word-boundary abbreviation matching (e.g. "ADCB" as a standalone word)
+    3. IBAN bank code detection (e.g. AE86 0410 → Sharjah Islamic Bank)
+    """
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            all_text = ""
+            for page in pdf.pages[:2]:
+                text = page.extract_text() or ""
+                all_text += " " + text
+                text_lower = text.lower()
+
+                # Method 1: Full-phrase matching
+                for pattern, bank_name in _KNOWN_BANKS:
+                    if pattern in text_lower:
+                        return bank_name
+
+            # Method 2: Word-boundary abbreviation matching
+            # Only check the very top of page 1 (first ~300 chars) — short
+            # abbreviations like "ADCB" appear in transaction descriptions
+            # on later pages and cause false positives.
+            page1_header = (pdf.pages[0].extract_text() or "")[:300].lower()
+            for abbr, bank_name in _KNOWN_BANKS_WORD_BOUNDARY:
+                if re.search(r'\b' + re.escape(abbr) + r'\b', page1_header):
+                    return bank_name
+
+            # Method 3: IBAN bank code detection
+            # UAE IBANs: AE + 2 check digits + 3-4 digit bank code + account
+            iban_match = re.search(r'AE\d{2}(\d{4})', all_text)
+            if iban_match:
+                bank_code = iban_match.group(1)
+                if bank_code in _IBAN_BANK_CODES:
+                    return _IBAN_BANK_CODES[bank_code]
+
+    except Exception as e:
+        logger.debug("Bank name detection failed: %s", e)
+
+    return None
+
+
 def save_extraction_template(
     pdf_path: str | Path,
     col_map: dict,
@@ -413,6 +524,11 @@ def save_extraction_template(
                   "header_row_count", "unsigned_is_debit")
     }
 
+    # Auto-detect bank name from PDF content
+    bank_name = detect_bank_name(pdf_path)
+    if bank_name:
+        logger.info("Auto-detected bank name: %s", bank_name)
+
     template_id = save_template(
         fingerprint=fingerprint,
         column_count=layout["column_count"],
@@ -423,6 +539,7 @@ def save_extraction_template(
         header_x_positions=layout.get("header_x_positions"),
         page_width=layout.get("page_width"),
         page_height=layout.get("page_height"),
+        bank_name=bank_name,
     )
 
     if template_id:
@@ -444,8 +561,9 @@ def save_extraction_template(
             save_column_aliases(template_id, aliases)
 
         logger.info(
-            "New template saved (id=%s, cols=%d, strategy=%s, headers=%s)",
+            "New template saved (id=%s, bank=%s, cols=%d, strategy=%s, headers=%s)",
             template_id,
+            bank_name or "unknown",
             layout["column_count"],
             strategy,
             layout["header_texts"],
