@@ -18,6 +18,7 @@ try:
     from database.db import (
         find_template_by_fingerprint,
         find_template_fuzzy,
+        find_templates_by_bank,
         save_template,
         save_column_aliases,
         increment_success_count,
@@ -368,6 +369,27 @@ def match_template(pdf_path: str | Path) -> Optional[dict]:
         )
         increment_success_count(template["id"])
         return template
+
+    # Tier 3: Same-bank fallback — detect bank name from PDF content,
+    # then try all templates from that bank (sorted by success_count).
+    # This handles cases where the same bank changes format slightly
+    # (different account types, date ranges, or layout tweaks).
+    bank_name = detect_bank_name(pdf_path)
+    if bank_name:
+        bank_templates = find_templates_by_bank(bank_name)
+        if bank_templates:
+            # Return the most-used template for this bank.
+            # The per-page strategy selection in pdf_parser will handle
+            # any column count differences between pages.
+            best = bank_templates[0]
+            logger.info(
+                "Template matched (same-bank fallback, id=%s, bank=%s, uses=%d)",
+                best["id"],
+                bank_name,
+                best["success_count"],
+            )
+            increment_success_count(best["id"])
+            return best
 
     logger.info("No matching template found — will run full extraction pipeline")
     return None

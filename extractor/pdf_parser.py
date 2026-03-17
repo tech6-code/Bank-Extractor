@@ -882,44 +882,41 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                     for ri, r in enumerate(cleaned):
                         logger.info(f"  Page {page_num}, table {ti}, row {ri}: {[c[:50] for c in r]}")
 
-                # If col_map was detected for a different column count, try re-detecting.
-                # Even forced col_maps from templates must be re-detected when the
-                # table has FEWER columns — using out-of-range indices would shift
-                # debit/credit/balance into wrong columns.
+                # ── Per-page column mapping ────────────────────────────
+                # When a page has a different column count than the
+                # primary col_map (e.g. last page has 5 cols vs 6),
+                # use a PAGE-LOCAL col_map so we don't corrupt the
+                # primary mapping for subsequent pages.
+                page_col_map = col_map  # default: use the primary
                 if col_map is not None and num_cols != col_map_num_cols and (
                     not forced_col_map or num_cols < col_map_num_cols
                 ):
                     logger.info(f"Page {page_num}, table {ti}: col_map has {col_map_num_cols} cols but table has {num_cols} cols, re-detecting")
                     new_map = _detect_columns(cleaned, page)
                     if new_map:
-                        col_map = new_map
-                        col_map_num_cols = num_cols
-                        logger.info(f"Column mapping re-detected on page {page_num}: {col_map}")
-                        if "amount" in col_map:
-                            amt_idx = col_map["amount"]
+                        page_col_map = new_map
+                        logger.info(f"Page {page_num}: page-local col_map re-detected: {page_col_map}")
+                        if "amount" in page_col_map:
+                            amt_idx = page_col_map["amount"]
                             has_explicit_plus = False
-                            skip_rows = col_map.get("header_row_count", 0)
+                            skip_rows = page_col_map.get("header_row_count", 0)
                             for sample_row in cleaned[skip_rows:skip_rows + 30]:
                                 if amt_idx < len(sample_row):
                                     val = sample_row[amt_idx].strip()
                                     if val.startswith("+"):
                                         has_explicit_plus = True
                                         break
-                            col_map["unsigned_is_debit"] = has_explicit_plus
+                            page_col_map["unsigned_is_debit"] = has_explicit_plus
                     else:
-                        # Re-detection failed. If the table has MORE cols than col_map needs,
-                        # still try processing with existing col_map (columns may just be offset).
-                        # If fewer cols, try content-based inference before skipping.
+                        # Re-detection failed — try content inference
                         max_col_idx = max(v for k, v in col_map.items() if isinstance(v, int))
                         if num_cols > max_col_idx:
                             logger.info(f"Page {page_num}, table {ti}: re-detection failed but table has enough cols ({num_cols} > max_idx {max_col_idx}), trying existing col_map")
                         else:
-                            # Try content-based inference as last resort
                             inferred = _infer_columns_by_content(cleaned)
                             if inferred:
-                                col_map = inferred
-                                col_map_num_cols = num_cols
-                                logger.info(f"Page {page_num}, table {ti}: content-inferred col_map: {col_map}")
+                                page_col_map = inferred
+                                logger.info(f"Page {page_num}, table {ti}: content-inferred page-local col_map: {page_col_map}")
                             else:
                                 logger.info(f"Page {page_num}, table {ti}: skipping table (re-detection failed, {num_cols} cols < needed {max_col_idx + 1})")
                                 continue
@@ -935,6 +932,7 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                         logger.debug(f"Page {page_num}: could not detect columns")
                         continue
                     col_map_num_cols = num_cols
+                    page_col_map = col_map
                     logger.info(f"Column mapping detected on page {page_num}: {col_map}")
                     # Detect sign convention for single "amount" column
                     if "amount" in col_map:
@@ -951,50 +949,56 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                 elif forced_col_map and col_map_num_cols == 0:
                     col_map_num_cols = num_cols
 
-                # Process ALL rows — no header skipping.
+                # Process ALL rows using page_col_map (which may differ from
+                # the primary col_map on pages with different column counts).
                 # _row_to_transaction() validates the date column; header rows
-                # (containing "Date" / "التاريخ" instead of an actual date) are
-                # rejected by the date-pattern check and return None.
-                # This eliminates false skips of first-row data on every page.
+                # are rejected by the date-pattern check and return None.
                 #
                 # Continuation rows (no date, only description text) are merged
                 # into the previous transaction's description.
+                effective_map = page_col_map
                 page_txn_count = 0
-                desc_idx = col_map.get("description")
+                desc_idx = effective_map.get("description")
                 for ri, row in enumerate(cleaned):
-                    txn = _row_to_transaction(row, col_map)
+                    txn = _row_to_transaction(row, effective_map)
                     if txn:
                         # If description is empty or very short, try word-position recovery
                         if len(txn["description"]) < 3:
                             recovered = _recover_description_from_words(
-                                page, ri, None, col_map, cleaned
+                                page, ri, None, effective_map, cleaned
                             )
                             if recovered:
                                 txn["description"] = recovered
                                 logger.debug(f"Page {page_num}: recovered description for row {ri}: {txn['description'][:60]}...")
                         transactions.append(txn)
                         page_txn_count += 1
-                        # Log first 3 transactions per page for debugging
                         if page_txn_count <= 3:
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: EXTRACTED txn #{len(transactions)}: date={txn['date']}, desc={txn['description'][:50]!r}, debit={txn['debit']}, credit={txn['credit']}, balance={txn['balance']}")
                     else:
                         # Check if this is a continuation row (no date but has description text).
-                        # Merge its description into the previous transaction.
-                        if (
-                            transactions
-                            and desc_idx is not None
-                            and isinstance(desc_idx, int)
-                            and desc_idx < len(row)
-                        ):
-                            continuation_text = row[desc_idx].strip()
-                            if continuation_text and len(continuation_text) > 1:
-                                # Verify this row has no date (first col is empty or non-date)
-                                date_idx = col_map.get("date", 0)
-                                date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
-                                if not date_cell:
+                        # Merge ALL non-date, non-amount text into the previous transaction's description.
+                        if transactions:
+                            date_idx = effective_map.get("date", 0)
+                            date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
+                            if not date_cell:
+                                # Collect text from all non-financial columns
+                                amount_cols = {
+                                    effective_map.get(k)
+                                    for k in ("debit", "credit", "balance", "amount")
+                                    if isinstance(effective_map.get(k), int)
+                                }
+                                amount_cols.add(date_idx)
+                                parts = []
+                                for ci, cell in enumerate(row):
+                                    if ci in amount_cols:
+                                        continue
+                                    txt = cell.strip()
+                                    if txt and len(txt) > 1:
+                                        parts.append(txt)
+                                if parts:
+                                    continuation_text = "/".join(parts)
                                     transactions[-1]["description"] += "/" + continuation_text
 
-                        # Log first few rejected rows per page too
                         if ri < 3:
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: REJECTED (returned None), row={[c[:40] for c in row]}")
                 logger.info(f"Page {page_num}, table {ti}: extracted {page_txn_count} transactions (running total: {len(transactions)})")

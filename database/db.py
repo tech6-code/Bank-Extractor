@@ -123,6 +123,39 @@ def find_template_fuzzy(header_texts: list[str], column_count: int) -> Optional[
         return None
 
 
+def find_templates_by_bank(bank_name: str) -> list[dict]:
+    """Find all templates for a given bank name.
+
+    Used as a third-tier fallback when exact fingerprint and fuzzy header
+    matching both fail, but the bank name is detected from the PDF content.
+    Returns all templates for that bank, sorted by success_count descending
+    (most-used templates first).
+    """
+    if not bank_name:
+        return []
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT * FROM templates WHERE bank_name = %s ORDER BY success_count DESC",
+                (bank_name,),
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                row["col_map"] = json.loads(row["col_map"]) if isinstance(row["col_map"], str) else row["col_map"]
+                row["header_texts"] = json.loads(row["header_texts"]) if isinstance(row["header_texts"], str) else row["header_texts"]
+                if row.get("header_x_positions"):
+                    row["header_x_positions"] = (
+                        json.loads(row["header_x_positions"])
+                        if isinstance(row["header_x_positions"], str)
+                        else row["header_x_positions"]
+                    )
+            return rows
+    except Error as e:
+        logger.warning("Failed to find templates by bank: %s", e)
+        return []
+
+
 def save_template(
     fingerprint: str,
     column_count: int,
