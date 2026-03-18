@@ -130,8 +130,13 @@ AMOUNT_KEYWORDS = {
     "transaction amount", "txn amount", "tran amount", "trans amount",
     "net amount", "net amt",
     "local amount", "foreign amount",
-    # Combined Dr/Cr column (signed single amount column)
+    # Combined Dr/Cr column (signed single amount column) — various separator styles
     "dr/cr", "cr/dr", "dr / cr", "cr / dr",
+    "dr./cr.", "cr./dr.", "dr. / cr.", "cr. / dr.",
+    "dr./cr", "cr./dr",
+    "debit/credit", "credit/debit",
+    "debit / credit", "credit / debit",
+    "withdrawals/deposits", "deposits/withdrawals",
 }
 
 # Columns to skip — reference numbers, cheque nos, etc. are not transaction data
@@ -588,9 +593,16 @@ def classify_column_header(header: str) -> tuple[str, float]:
 
     # ── 7. Amount (combined/signed single column) ────────────────────────────
     _score("amount", AMOUNT_KEYWORDS,
-           ("amount", " amt", "dr/cr", "cr/dr"))
-    if h in ("dr/cr", "cr/dr", "dr / cr", "cr / dr"):
+           ("amount", " amt", "dr/cr", "cr/dr", "debit/credit", "credit/debit",
+            "withdrawals/deposits", "deposits/withdrawals"))
+    if h in ("dr/cr", "cr/dr", "dr / cr", "cr / dr",
+             "dr./cr.", "cr./dr.", "dr. / cr.", "cr. / dr.",
+             "debit/credit", "credit/debit"):
         scores["amount"] = max(scores.get("amount", 0.0), 0.95)
+    # Also catch via h_nodot (e.g. "dr./cr." → "dr /cr" won't match above,
+    # but "dr /cr" contains "dr" and "cr" — check common patterns)
+    if h_nodot in ("dr /cr", "cr /dr", "dr/ cr", "cr/ dr"):
+        scores["amount"] = max(scores.get("amount", 0.0), 0.90)
 
     if not scores:
         return "unknown", 0.0
@@ -725,16 +737,23 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
 
     if pymupdf_ok or pdfplumber_ok:
         if pymupdf_ok and pdfplumber_ok:
-            # Both found valid transactions — prefer whichever found more rows.
-            # PyMuPDF typically wins by the number of first-row-per-page it captures.
-            if len(pymupdf_txns) >= len(pdfplumber_txns):
+            # Both found valid transactions — prefer whichever scores higher on
+            # quality (weighted by financial data completeness, not raw row count).
+            # This prevents a strategy that extracts hundreds of garbage rows from
+            # beating one that extracts fewer but correctly structured transactions.
+            pymupdf_score = _extraction_quality_score(pymupdf_txns)
+            pdfplumber_score = _extraction_quality_score(pdfplumber_txns)
+            if pymupdf_score >= pdfplumber_score:
                 transactions = pymupdf_txns
                 source = "pymupdf"
                 detected_col_map = pymupdf_col_map
+                # Supplement: inject pdfplumber rows for date ranges winner missed
+                transactions = _fill_page_gaps(transactions, pdfplumber_txns, "pymupdf", "pdfplumber")
             else:
                 transactions = pdfplumber_txns
                 source = "pdfplumber"
                 detected_col_map = pdfplumber_col_map
+                transactions = _fill_page_gaps(transactions, pymupdf_txns, "pdfplumber", "pymupdf")
         elif pymupdf_ok:
             transactions = pymupdf_txns
             source = "pymupdf"
@@ -748,6 +767,34 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
             f"Strategy 1 ({source}): {len(transactions)} transactions "
             f"(pymupdf={len(pymupdf_txns)}, pdfplumber={len(pdfplumber_txns)})"
         )
+
+        # ── Quality gate: if table strategy has very poor financial data coverage,
+        # try words/text as an alternative and prefer whichever is better.
+        # Threshold: <30% of rows with debit/credit means the col_map is likely wrong.
+        table_quality = _extraction_quality_score(transactions)
+        n = len(transactions)
+        has_amounts_pct = sum(1 for t in transactions if t.get("debit") or t.get("credit")) / n if n else 0
+        if has_amounts_pct < 0.30:
+            logger.info(
+                f"Strategy 1 quality low ({has_amounts_pct:.0%} rows have amounts) — "
+                "trying Strategy 2 (words) as alternative"
+            )
+            try:
+                words_txns = _extract_from_words(pdf_path)
+                if words_txns and _extraction_quality_score(words_txns) > table_quality:
+                    logger.info(
+                        f"Words strategy is better ({len(words_txns)} txns) — using it instead"
+                    )
+                    meta = {"_extraction_meta": {"strategy": "words", "template_matched": False}}
+                    words_txns.append(meta)
+                    return words_txns
+            except Exception as e:
+                logger.warning(f"Word extraction (quality fallback) failed: {e}")
+
+        # Deduplicate: remove any transactions added by gap-fill that are
+        # exact duplicates of existing rows (same date + debit + credit + balance).
+        transactions = _deduplicate_transactions(transactions)
+
         # Append metadata for template saving (include col_map)
         meta = {"_extraction_meta": {
             "strategy": source,
@@ -759,25 +806,43 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
 
     # Strategy 2: position-based word extraction (for PDFs without table structures)
     logger.info("Table strategies found 0 valid transactions, trying Strategy 2 (words)")
+    words_txns: list[dict] = []
     try:
-        transactions = _extract_from_words(pdf_path)
-        if transactions:
-            meta = {"_extraction_meta": {"strategy": "words", "template_matched": False}}
-            transactions.append(meta)
-            return transactions
+        words_txns = _extract_from_words(pdf_path)
     except Exception as e:
         logger.warning(f"Word extraction failed: {e}")
 
-    # Strategy 3: text-based line parsing
+    # Strategy 3: text-based line parsing (always try; pick better of words vs text)
+    text_txns: list[dict] = []
     try:
-        transactions = _extract_from_text(pdf_path)
-        if transactions:
-            meta = {"_extraction_meta": {"strategy": "text", "template_matched": False}}
-            transactions.append(meta)
-        return transactions
+        text_txns = _extract_from_text(pdf_path)
     except Exception as e:
         logger.warning(f"Text extraction failed: {e}")
-        return []
+
+    # Pick whichever fallback strategy gives better quality
+    if words_txns or text_txns:
+        words_score = _extraction_quality_score(words_txns)
+        text_score = _extraction_quality_score(text_txns)
+        if text_score > words_score:
+            logger.info(
+                f"Text strategy wins fallback ({len(text_txns)} txns, score={text_score:.1f}) "
+                f"over words ({len(words_txns)} txns, score={words_score:.1f})"
+            )
+            transactions = text_txns
+            fallback_source = "text"
+        else:
+            logger.info(
+                f"Words strategy wins fallback ({len(words_txns)} txns, score={words_score:.1f}) "
+                f"over text ({len(text_txns)} txns, score={text_score:.1f})"
+            )
+            transactions = words_txns
+            fallback_source = "words"
+        if transactions:
+            meta = {"_extraction_meta": {"strategy": fallback_source, "template_matched": False}}
+            transactions.append(meta)
+            return transactions
+
+    return []
 
 
 def _extract_with_template(
@@ -823,6 +888,108 @@ def _has_merged_rows(transactions: list[dict]) -> bool:
     return merged_count > len(transactions) * 0.3
 
 
+def _extraction_quality_score(transactions: list[dict]) -> float:
+    """Score extraction quality as a weighted transaction count.
+
+    Returns a float that naturally ranks strategies:
+      - More transactions with financial data score higher
+      - Transactions missing both debit and credit are penalised (worth 0.1)
+      - Having a balance value adds a small bonus per row (0.3)
+
+    This prevents a strategy that extracts 200 garbage rows (no amounts)
+    from beating one that correctly extracts 80 real transactions.
+    """
+    if not transactions:
+        return 0.0
+    score = 0.0
+    for t in transactions:
+        has_amount = bool(t.get("debit") or t.get("credit"))
+        has_balance = bool(t.get("balance"))
+        row_score = (0.7 if has_amount else 0.1) + (0.3 if has_balance else 0.0)
+        score += row_score
+    return score
+
+
+def _fill_page_gaps(
+    winner: list[dict], loser: list[dict], winner_source: str, loser_source: str
+) -> list[dict]:
+    """Supplement the winner strategy with transactions from the loser on missed pages.
+
+    Some pages fail with one strategy but succeed with the other.  This function
+    detects date ranges where the winner has NO transactions and injects the
+    loser's transactions for those ranges, then re-sorts by date.
+
+    Only injects when the loser's transactions for a gap have meaningful financial
+    data (at least 50% have debit or credit).
+    """
+    if not loser:
+        return winner
+
+    # Build a set of dates already in winner (normalised to string)
+    winner_dates: set[str] = {t.get("date", "") for t in winner}
+
+    # Find loser transactions whose dates don't appear at all in winner
+    gaps: list[dict] = []
+    for t in loser:
+        d = t.get("date", "")
+        if d and d not in winner_dates:
+            gaps.append(t)
+
+    if not gaps:
+        return winner
+
+    # Only inject if at least 50% of gap rows have financial amounts
+    # (protects against injecting header rows or garbage)
+    gap_with_amounts = sum(1 for t in gaps if t.get("debit") or t.get("credit"))
+    if gap_with_amounts < len(gaps) * 0.5:
+        logger.info(
+            f"Gap fill: {len(gaps)} rows from {loser_source} skipped "
+            f"(only {gap_with_amounts}/{len(gaps)} have amounts)"
+        )
+        return winner
+
+    logger.info(
+        f"Gap fill: injecting {len(gaps)} rows from {loser_source} into {winner_source} "
+        f"(dates not covered by winner)"
+    )
+    combined = winner + gaps
+    # Re-sort by date string (lexicographic — good enough for same-format dates)
+    # Transactions with the same date keep their relative order via stable sort.
+    combined.sort(key=lambda t: t.get("date", ""))
+    return combined
+
+
+def _deduplicate_transactions(transactions: list[dict]) -> list[dict]:
+    """Remove exact duplicate transactions.
+
+    Two transactions are considered duplicates when all five fields are identical:
+    date, description (first 40 chars), debit, credit, and balance.
+
+    Using description in the key prevents false removal of legitimate same-day,
+    same-amount transactions with different descriptions (e.g. two salary credits).
+    Preserves first occurrence and order.
+    """
+    seen: set[tuple] = set()
+    result: list[dict] = []
+    for t in transactions:
+        desc_prefix = t.get("description", "")[:40]
+        key = (
+            t.get("date", ""),
+            desc_prefix,
+            t.get("debit", ""),
+            t.get("credit", ""),
+            t.get("balance", ""),
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(t)
+        else:
+            logger.debug(f"Dedup: removed duplicate transaction: {key}")
+    if len(result) < len(transactions):
+        logger.info(f"Dedup: removed {len(transactions) - len(result)} duplicate transaction(s)")
+    return result
+
+
 def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> list[dict]:
     """Extract transactions from structured PDF tables by mapping columns."""
     transactions = []
@@ -834,7 +1001,13 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
-            tables = page.extract_tables()
+            try:
+                tables = page.extract_tables()
+            except Exception as e:
+                # PSKeyword, PDFSyntaxError, and other parsing errors on individual
+                # pages must not abort the whole document — skip the page and continue.
+                logger.warning(f"Page {page_num}: pdfplumber table extraction error (skipping): {e}")
+                continue
             if not tables:
                 logger.debug(f"Page {page_num}: no tables found")
                 continue
@@ -1513,6 +1686,9 @@ def _extract_from_pymupdf(pdf_path: Path, forced_col_map: dict | None = None) ->
                     "Upgrade: pip install --upgrade pymupdf"
                 )
                 return [], None
+            except Exception as e:
+                logger.warning(f"PyMuPDF page {page_num}: find_tables() error (skipping): {e}")
+                continue
 
             if not tabs.tables:
                 logger.debug(f"PyMuPDF page {page_num}: no tables found")
@@ -1953,25 +2129,59 @@ def _split_signed_amount(raw: str, unsigned_is_debit: bool = False) -> tuple[str
 def _extract_from_words(pdf_path: Path) -> list[dict]:
     """Extract transactions using word positions when tables aren't detected.
 
+    Uses a two-pass approach:
+      Pass 1 — scan ALL pages to find the best column header line (highest score).
+               This means pages with an account summary before the transaction table
+               no longer prevent column detection.
+      Pass 2 — extract transactions from ALL pages using the detected col_boundaries.
+
     Detects column layout from header words (Date, Description, Withdrawal/Debit,
     Deposit/Credit, Balance) and assigns values by x-coordinate.
     """
-    col_boundaries = None  # {date_x, desc_x, debit_x, credit_x, balance_x}
+    # ── Pass 1: find best col_boundaries across all pages ────────────────────
+    col_boundaries = None
+    best_header_score = 0
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            try:
+                words = page.extract_words()
+            except Exception as e:
+                logger.warning(f"Words pass 1, page {page_num + 1}: extract_words error: {e}")
+                continue
+            if not words:
+                continue
+            candidate = _detect_word_columns(words)
+            if candidate is None:
+                continue
+            # Score this candidate: count columns it covers
+            col_count = sum(1 for k in ("debit_x", "credit_x", "balance_x", "amount_x")
+                            if candidate.get(k) is not None)
+            if col_count > best_header_score:
+                best_header_score = col_count
+                col_boundaries = candidate
+                logger.info(
+                    f"Word strategy: best col_boundaries updated from page {page_num + 1} "
+                    f"(score={col_count}): {col_boundaries}"
+                )
+
+    if col_boundaries is None:
+        logger.info("Word strategy: no column headers found on any page")
+        return []
+
+    # ── Pass 2: extract transactions using detected col_boundaries ────────────
     transactions = []
     pending_desc_lines = []
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages):
-            words = page.extract_words()
+            try:
+                words = page.extract_words()
+            except Exception as e:
+                logger.warning(f"Words pass 2, page {page_num + 1}: extract_words error: {e}")
+                continue
             if not words:
                 continue
-
-            # Try to detect column positions from header words on this page
-            if col_boundaries is None:
-                col_boundaries = _detect_word_columns(words)
-                if col_boundaries is None:
-                    continue
-                logger.info(f"Word column positions detected on page {page_num + 1}: {col_boundaries}")
 
             # Group words by y-position (same line)
             lines_by_top = defaultdict(list)
@@ -2227,8 +2437,12 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
     pending_desc_lines = []  # Non-date lines accumulated before a date line
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
+        for page_num, page in enumerate(pdf.pages, 1):
+            try:
+                text = page.extract_text()
+            except Exception as e:
+                logger.warning(f"Text strategy, page {page_num}: extract_text error (skipping): {e}")
+                continue
             if not text:
                 continue
 
@@ -2486,6 +2700,21 @@ def _clean_amount(value: str) -> str:
         value = re.sub(r"[A-Za-z$€£¥₹+]", "", value).strip().rstrip(".")
         if not FLEX_AMOUNT_RE.fullmatch(value):
             return ""
+
+    # Validate thousands-grouping: if commas are present, groups after the first
+    # must be exactly 3 digits (e.g. "1,234,567.89" is valid but
+    # "-2146188822,11125238215385" is not — it's concatenated IDs, not an amount).
+    sign_stripped = value.lstrip("-")
+    if "," in sign_stripped:
+        dot_pos = sign_stripped.find(".")
+        integer_part = sign_stripped[:dot_pos] if dot_pos != -1 else sign_stripped
+        parts = integer_part.split(",")
+        # First group: 1–3 digits; every subsequent group: exactly 3 digits
+        if len(parts) > 1:
+            first_ok = 1 <= len(parts[0]) <= 3
+            rest_ok = all(len(p) == 3 and p.isdigit() for p in parts[1:])
+            if not (first_ok and rest_ok):
+                return ""
 
     return value
 

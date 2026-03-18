@@ -147,10 +147,28 @@ def validate_balances(transactions: list[dict]) -> dict:
     asc_result = _validate_in_order(transactions, "ascending")
     desc_result = _validate_in_order(transactions, "descending")
 
-    if asc_result["valid_rows"] >= desc_result["valid_rows"]:
-        result = asc_result
-    else:
-        result = desc_result
+    best = asc_result if asc_result["valid_rows"] >= desc_result["valid_rows"] else desc_result
+
+    # If accuracy is very low (<20%) despite having balance data, try with debit/credit
+    # swapped.  Some PDFs (e.g. Ecash) label withdrawals as "credit" and deposits as
+    # "debit", or have a single column whose header was misclassified.
+    if best["accuracy_pct"] < 20.0 and best["validated_rows"] > 5:
+        swapped = [
+            {**t, "debit": t.get("credit", ""), "credit": t.get("debit", "")}
+            for t in transactions
+        ]
+        sw_asc = _validate_in_order(swapped, "ascending")
+        sw_desc = _validate_in_order(swapped, "descending")
+        sw_best = sw_asc if sw_asc["valid_rows"] >= sw_desc["valid_rows"] else sw_desc
+        if sw_best["valid_rows"] > best["valid_rows"]:
+            logger.info(
+                f"Balance validation: swapped debit/credit gives better result "
+                f"({sw_best['valid_rows']} vs {best['valid_rows']})"
+            )
+            best = sw_best
+            best["direction"] = sw_best["direction"] + " (swapped)"
+
+    result = best
 
     logger.info(
         f"Balance validation: {result['valid_rows']}/{result['validated_rows']} valid "
