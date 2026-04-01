@@ -46,7 +46,8 @@ AMOUNT_RE = re.compile(r"-?[\d,]+\.\d{2}")
 SIGNED_AMOUNT_RE = re.compile(r"[+\-]?[\d,]+\.\d{2}")
 FLEX_AMOUNT_RE = re.compile(r"-?[\d,]+(?:\.\d{1,2})?$")
 # For finding amounts in text lines (must be whitespace-bounded)
-TEXT_AMOUNT_RE = re.compile(r"(?:^|\s)(-?[\d,]+(?:\.\d{1,2})?)(?=\s|$)")
+# Captures optional +/- prefix so Mashreq-style "+2.00" amounts are recognised.
+TEXT_AMOUNT_RE = re.compile(r"(?:^|\s)([+\-]?[\d,]+(?:\.\d{1,2})?)(?=\s|$)")
 
 # ── Universal Column Keyword Sets ─────────────────────────────────────────────
 # Covers major banks: US, UK, India, Middle East, Southeast Asia, Africa, etc.
@@ -85,6 +86,8 @@ DESC_KEYWORDS = {
     # Other region-specific names
     "reference description", "ref description",
     "chalan description", "instrument description",
+    # Transaction column used by some banks (Mashreq Standard) as the description column
+    "transaction", "transactions",
 }
 
 DEBIT_KEYWORDS = {
@@ -451,8 +454,9 @@ def _recover_description_from_words(page, row_idx: int, table_bbox: tuple | None
             # Skip words that are in numeric columns
             if w["x0"] >= desc_end_x:
                 continue
-            # Skip pure numbers (they belong to amount columns)
-            if AMOUNT_RE.match(w["text"].replace(",", "")):
+            # Skip pure numbers (they belong to amount columns); also skip
+            # +/- prefixed amounts like "+2.00" (Mashreq-style signed columns).
+            if AMOUNT_RE.match(w["text"].replace(",", "").lstrip("+")):
                 continue
             # Skip date words
             if any(p.match(w["text"]) for p in DATE_PATTERNS):
@@ -691,7 +695,14 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
 
     # ── Template-guided extraction ────────────────────────────────────────────
     # If a matching template was found, use its saved col_map and preferred strategy.
-    if template and template.get("col_map") and template.get("strategy"):
+    _tmpl_strategy = template.get("strategy") if template else None
+    _tmpl_col_map  = template.get("col_map")  if template else None
+    # text/words strategies don't require a col_map — allow empty {} or None.
+    _tmpl_usable = (
+        _tmpl_strategy in ("text", "words")
+        or bool(_tmpl_col_map)
+    )
+    if template and _tmpl_strategy and _tmpl_usable:
         saved_col_map = template["col_map"]
         preferred_strategy = template["strategy"]
         logger.info(
@@ -701,22 +712,34 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
 
         transactions = _extract_with_template(pdf_path, saved_col_map, preferred_strategy)
         if transactions:
-            # Append metadata for the server
-            meta = {
-                "_extraction_meta": {
-                    "strategy": preferred_strategy,
-                    "col_map": saved_col_map,
-                    "template_matched": True,
-                    "template_id": template.get("id"),
-                    "template_bank_name": template.get("bank_name"),
+            # Quality gate: if template-guided extraction has poor financial data,
+            # fall back to the full pipeline which can use hybrid strategies
+            # (e.g. PyMuPDF for pages with tables + text for pages without).
+            tmpl_quality = _extraction_quality_score(transactions)
+            n = len(transactions)
+            has_bal_pct = sum(1 for t in transactions if t.get("balance")) / n if n else 0
+            if has_bal_pct < 0.40:
+                logger.warning(
+                    f"Template-guided extraction quality low ({has_bal_pct:.0%} rows have balance, "
+                    f"quality={tmpl_quality:.1f}) — falling back to full pipeline"
+                )
+            else:
+                # Append metadata for the server
+                meta = {
+                    "_extraction_meta": {
+                        "strategy": preferred_strategy,
+                        "col_map": saved_col_map,
+                        "template_matched": True,
+                        "template_id": template.get("id"),
+                        "template_bank_name": template.get("bank_name"),
+                    }
                 }
-            }
-            transactions.append(meta)
-            logger.info(
-                f"Template-guided extraction: {len(transactions) - 1} transactions "
-                f"(template_id={template.get('id')})"
-            )
-            return transactions
+                transactions.append(meta)
+                logger.info(
+                    f"Template-guided extraction: {len(transactions) - 1} transactions "
+                    f"(template_id={template.get('id')})"
+                )
+                return transactions
         else:
             logger.warning("Template-guided extraction yielded 0 transactions, falling back to full pipeline")
 
@@ -790,6 +813,41 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
                     return words_txns
             except Exception as e:
                 logger.warning(f"Word extraction (quality fallback) failed: {e}")
+
+        # ── Supplement: if text/words extraction finds significantly more
+        # transactions, some pages likely had no tables.  Merge the extra
+        # transactions (those not already present by date+amount+balance).
+        # Try both strategies and use whichever adds more quality transactions.
+        supplement_candidates = []
+        for strat_name, strat_fn in [("words", _extract_from_words), ("text", _extract_from_text)]:
+            try:
+                strat_txns = strat_fn(pdf_path)
+                if strat_txns and len(strat_txns) > len(transactions) * 1.3:
+                    supplement_candidates.append((strat_name, strat_txns))
+            except Exception:
+                pass
+
+        if supplement_candidates:
+            # Pick the supplement with the highest quality score
+            supplement_candidates.sort(key=lambda x: _extraction_quality_score(x[1]), reverse=True)
+            supp_name, supp_txns = supplement_candidates[0]
+
+            existing_keys = {
+                (t.get("date", ""), t.get("debit", ""), t.get("credit", ""), t.get("balance", ""))
+                for t in transactions
+            }
+            added = 0
+            for t in supp_txns:
+                key = (t.get("date", ""), t.get("debit", ""), t.get("credit", ""), t.get("balance", ""))
+                if key not in existing_keys:
+                    transactions.append(t)
+                    existing_keys.add(key)
+                    added += 1
+            if added:
+                logger.info(
+                    f"Supplemented table extraction with {added} {supp_name}-strategy "
+                    f"transactions (total now {len(transactions)})"
+                )
 
         # Deduplicate: remove any transactions added by gap-fill that are
         # exact duplicates of existing rows (same date + debit + credit + balance).
@@ -878,11 +936,14 @@ def _has_merged_rows(transactions: list[dict]) -> bool:
     merged_count = 0
     for txn in transactions:
         date = txn.get("date", "")
-        # Count how many date patterns appear in the date field
-        date_matches = []
+        # Count how many distinct (non-overlapping) date matches appear in the date field.
+        # Multiple patterns can match the same text (e.g. "28 Nov 2024" matches both
+        # "D Mon YYYY" and "D Month YY-YYYY"), so deduplicate by match span.
+        seen_spans: set[tuple[int, int]] = set()
         for p in DATE_PATTERNS:
-            date_matches.extend(p.findall(date))
-        if len(date_matches) > 1:
+            for m in p.finditer(date):
+                seen_spans.add((m.start(), m.end()))
+        if len(seen_spans) > 1:
             merged_count += 1
     # If more than 30% of rows have multiple dates, extraction is broken
     return merged_count > len(transactions) * 0.3
@@ -1282,13 +1343,22 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
         col_map = None
         col_map_num_cols = 0
 
+        # NOTE: We intentionally do NOT use pdfplumber's "explicit" vertical
+        # strategy here even when explicit_lines is available.  In practice,
+        # pdfplumber silently drops the leftmost and rightmost column when the
+        # explicit boundaries sit close to the page edge, producing fewer
+        # columns than expected and a wrong col_map.  The text strategy is
+        # robust enough on its own; the wrong-col_map problem (e.g. Wio Bank
+        # cover page) is handled by date-content validation in pass 1 below.
+        _page_table_settings = {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+        }
+
         with pdfplumber.open(pdf_path) as pdf:
             # ── Pass 1: detect col_map ────────────────────────────────────
             for page_num, page in enumerate(pdf.pages, 1):
-                text_tables = page.extract_tables({
-                    "vertical_strategy": "text",
-                    "horizontal_strategy": "text",
-                })
+                text_tables = page.extract_tables(_page_table_settings)
                 if not text_tables:
                     continue
 
@@ -1301,14 +1371,44 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                         has_financial = any(
                             k in candidate for k in ("debit", "credit", "balance", "amount")
                         )
-                        if has_financial:
-                            col_map = candidate
-                            col_map_num_cols = len(cleaned[0])
-                            logger.info(
-                                f"Text strategy pass 1: col_map detected on page {page_num} "
-                                f"({col_map_num_cols} cols): {col_map}"
+                        if not has_financial:
+                            continue
+                        # Require at least one data row with date-like content
+                        # in the date column.  This rejects col_maps from cover /
+                        # summary pages whose "Date" header column actually holds
+                        # non-date text (e.g. Wio Bank cover page, index 3).
+                        if "date" in candidate:
+                            date_col = candidate["date"]
+                            # Date column must precede description column.
+                            # If date appears AFTER description in the table
+                            # (e.g. Wio Bank cover page: date=3, desc=0),
+                            # the col_map is from a summary/cover page — skip.
+                            desc_col = candidate.get("description")
+                            if desc_col is not None and date_col > desc_col:
+                                logger.debug(
+                                    f"Text strategy pass 1: rejected col_map on page "
+                                    f"{page_num} — date col {date_col} > desc col {desc_col}"
+                                )
+                                continue
+                            has_valid_date = any(
+                                date_col < len(row)
+                                and row[date_col]
+                                and DATE_START_RE.match(str(row[date_col]).strip())
+                                for row in cleaned[1:]
                             )
-                            break
+                            if not has_valid_date:
+                                logger.debug(
+                                    f"Text strategy pass 1: rejected col_map on page "
+                                    f"{page_num} — date col {date_col} has no date values"
+                                )
+                                continue
+                        col_map = candidate
+                        col_map_num_cols = len(cleaned[0])
+                        logger.info(
+                            f"Text strategy pass 1: col_map detected on page {page_num} "
+                            f"({col_map_num_cols} cols): {col_map}"
+                        )
+                        break
                 if col_map:
                     break
 
@@ -1318,10 +1418,7 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
             # ── Pass 2: extract transactions from all pages ───────────────
             if col_map:
                 for page_num, page in enumerate(pdf.pages, 1):
-                    text_tables = page.extract_tables({
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                    })
+                    text_tables = page.extract_tables(_page_table_settings)
                     if not text_tables:
                         continue
 
@@ -1470,6 +1567,19 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                     logger.warning(
                         f"Text strategy fallback: {no_debit_credit}/{len(sample)} "
                         f"transactions have no debit/credit — discarding results"
+                    )
+                    discard = True
+
+            # Also check: if a balance column is mapped but most transactions
+            # still lack a balance value, the table is over-split (text
+            # strategy created too many sub-columns) — discard.
+            if not discard and "balance" in col_map:
+                no_bal = sum(1 for t in transactions if not t.get("balance"))
+                if len(transactions) > 0 and no_bal / len(transactions) > 0.2:
+                    logger.warning(
+                        f"Text strategy fallback: {no_bal}/{len(transactions)} "
+                        f"transactions lack balance despite balance column — "
+                        f"discarding (over-split table)"
                     )
                     discard = True
 
@@ -1979,16 +2089,18 @@ def _infer_columns_by_content(table: list[list[str]]) -> dict | None:
         e0 = empty_scores[amount_cols[0]]
         e1 = empty_scores[amount_cols[1]]
 
-        # Check if first col has negative values (signed amount column)
-        has_negatives = False
+        # Check if first col has explicit +/- signs (signed amount column).
+        # Mashreq-style PDFs use + for credits and - for debits; checking only
+        # for "-" misses statements where all sampled rows are credits ("+").
+        has_explicit_sign = False
         for row in sample_rows:
             if amount_cols[0] < len(row):
                 val = row[amount_cols[0]].strip()
-                if val.startswith("-"):
-                    has_negatives = True
+                if val.startswith("-") or val.startswith("+"):
+                    has_explicit_sign = True
                     break
 
-        if has_negatives:
+        if has_explicit_sign:
             # Signed amount + balance (e.g. Wio Bank, or Sharjah page 10)
             col_map["amount"] = amount_cols[0]
             col_map["balance"] = amount_cols[1]
@@ -2026,9 +2138,13 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     date = get("date")
     date = re.sub(r"\s*([/\-.])\s*", r"\1", date)
     date = re.sub(r"\s+", " ", date).strip()
-    if not date or not any(p.search(date) for p in DATE_PATTERNS):
+    # Trim to just the matched date — prevents ref-number bleed when pdfplumber
+    # merges adjacent columns (e.g. "01/01/2025 P810554223" → "01/01/2025").
+    _date_match = next((p.search(date) for p in DATE_PATTERNS if p.search(date)), None)
+    if not _date_match:
         logger.debug(f"Row rejected (no valid date): date_cell={date!r}, row={[c[:30] for c in row]}")
         return None
+    date = _date_match.group(1) if _date_match.lastindex else _date_match.group(0)
 
     # Parse amount cells before skip-phrase checks. This prevents valid first-row
     # transactions (with page-header contamination) from being discarded.
@@ -2084,6 +2200,10 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         # Do not apply soft-skip phrase rejection for date+amount-valid rows.
         # Those phrases are common inside header-contaminated first transactions.
 
+    # Strip leading reference codes from description (safety net for cases where
+    # pdfplumber merged the ref-number column into the description column)
+    description = _strip_leading_ref(description)
+
     return {
         "date": date,
         "description": description,
@@ -2117,7 +2237,7 @@ def _split_signed_amount(raw: str, unsigned_is_debit: bool = False) -> tuple[str
     if is_credit:
         return "", cleaned
     elif is_debit:
-        return "-" + cleaned, ""
+        return cleaned, ""  # Debit stored as positive; sign is implied by the debit field
     else:
         # No explicit sign — convention-dependent
         if unsigned_is_debit:
@@ -2236,12 +2356,18 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 balance = ""
 
                 amount_raw = ""  # for single "amount" column
+                skipped_value_date = False
                 for w in line_words[1:]:  # Skip the date word
                     x = w["x0"]
                     text = w["text"]
 
                     # Skip "Cr." / "Dr." suffixes on balance
                     if text.rstrip(".").upper() in ("CR", "DR"):
+                        continue
+
+                    # Skip value-date words (second date that follows the transaction date)
+                    if not skipped_value_date and any(p.match(text) for p in DATE_PATTERNS):
+                        skipped_value_date = True
                         continue
 
                     is_number = bool(AMOUNT_RE.match(text.replace(",", "")))
@@ -2291,7 +2417,8 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                     desc = stripped if stripped else desc
                     # Don't skip — the row has valid date + amounts even if desc is empty
 
-                # Description is kept exactly as extracted — no regex cleaning.
+                # Strip leading reference codes from description
+                desc = _strip_leading_ref(desc)
 
                 # Only apply SKIP_PHRASES when NOT header-contaminated
                 if not header_contaminated:
@@ -2492,10 +2619,43 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                     # this is a continuation line for the previous transaction
                     if transactions and not pending_desc_lines:
                         prev = transactions[-1]
-                        prev["description"] = (
-                            (prev["description"] + " " + line).strip()
-                            if prev["description"] else line
+                        # Check if this line is a standalone balance value
+                        # (e.g. "8,390.6" or "33,580.1" on its own line after a transaction)
+                        stripped = line.strip().replace(",", "")
+                        # Use flexible regex: allow 0-2 decimal places (some banks
+                        # print "33,580.1" or "24,303" without trailing zeros)
+                        is_balance_line = (
+                            not prev.get("balance")
+                            and re.fullmatch(r"[+\-]?[\d]+(?:\.\d{1,2})?", stripped)
+                            and not DATE_START_RE.match(line)
                         )
+                        if is_balance_line:
+                            bal_val = stripped.lstrip("+-")
+                            new_balance = float(bal_val)
+                            prev["balance"] = f"{new_balance:,.2f}"
+                            # Reclassify debit/credit using balance delta when
+                            # the original classification was uncertain (single
+                            # amount with no balance on the date line).
+                            amt_str = prev.get("debit") or prev.get("credit") or ""
+                            if amt_str and prev_balance is not None:
+                                try:
+                                    amt_val = float(amt_str.replace(",", ""))
+                                    if new_balance < prev_balance - 0.5:
+                                        # Balance decreased → debit
+                                        prev["debit"] = f"{amt_val:,.2f}"
+                                        prev["credit"] = ""
+                                    elif new_balance > prev_balance + 0.5:
+                                        # Balance increased → credit
+                                        prev["debit"] = ""
+                                        prev["credit"] = f"{amt_val:,.2f}"
+                                except ValueError:
+                                    pass
+                            prev_balance = new_balance
+                        else:
+                            prev["description"] = (
+                                (prev["description"] + " " + line).strip()
+                                if prev["description"] else line
+                            )
                     else:
                         pending_desc_lines.append(line)
 
@@ -2572,13 +2732,27 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     # cluster — they're likely part of the description (e.g. "SITE 48",
     # "FLOOR 3", "REF 12345").  Keep only amounts that look monetary:
     # have a decimal point, have commas, are negative, or are large (>= 1000).
+    # Exception: if prev_balance validates the small integer as the real
+    # transaction amount (prev_balance ± small_int ≈ trailing_balance), keep it.
+    # This handles banks like Mashreq where fees are whole-number amounts (e.g. "2").
     while len(trailing_amounts) > 1:
-        first_val = trailing_amounts[0].group(1).replace(",", "")
+        first_raw = trailing_amounts[0].group(1)
+        first_val = first_raw.replace(",", "").lstrip("+-")
         has_decimal = "." in first_val
-        is_negative = first_val.startswith("-")
-        is_large = abs(float(first_val)) >= 1000 if first_val.replace("-", "").replace(".", "").isdigit() else False
-        if not has_decimal and not is_negative and not is_large:
-            # Small plain integer — likely part of description, not an amount
+        is_negative = first_raw.startswith("-")
+        is_explicit_plus = first_raw.startswith("+")
+        is_large = float(first_val) >= 1000 if first_val.replace(".", "").isdigit() else False
+        if not has_decimal and not is_negative and not is_explicit_plus and not is_large:
+            # Small plain integer — check balance chain before discarding
+            if prev_balance is not None and len(trailing_amounts) == 2:
+                try:
+                    cand_amt = float(first_val)
+                    cand_bal = float(trailing_amounts[1].group(1).replace(",", "").lstrip("+-"))
+                    if (abs(prev_balance + cand_amt - cand_bal) < 1.0 or
+                            abs(prev_balance - cand_amt - cand_bal) < 1.0):
+                        break  # balance chain confirms this integer is the real amount
+                except ValueError:
+                    pass
             trailing_amounts.pop(0)
         else:
             break
@@ -2590,6 +2764,9 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     desc_end = trailing_amounts[0].start()
     description = rest[:desc_end].strip()
     description = re.sub(r"\s+", " ", description).strip()
+    # Strip leading reference codes that bled into description (e.g. Mashreq
+    # "030POSB2433302kK Visa Purchase..." → "Visa Purchase...")
+    description = _strip_leading_ref(description)
 
     amount_strs = [m.group(1) for m in trailing_amounts]
 
@@ -2599,14 +2776,21 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
             return {"date": date, "description": description,
                     "debit": f"{abs(val):,.2f}", "credit": "", "balance": ""}
         elif prev_balance is not None:
-            # With a previous balance, we can infer: if this positive amount
-            # would make sense as a new balance (close to prev_balance), treat
-            # it as a balance.  Otherwise treat it as a credit amount.
-            # Heuristic: if it's within 2x of prev_balance, likely a balance.
-            if prev_balance > 0 and 0.1 * prev_balance <= val <= 10 * prev_balance:
+            # Single positive amount with prev_balance context.
+            # Check if balance chain validates it as a real transaction amount
+            # (prev_balance ± val ≈ some reasonable next balance), which means
+            # the balance will appear on the next line.  Treat as debit if
+            # prev_balance - val > 0 (more common), otherwise credit.
+            # Only fall back to "balance" interpretation when the value is very
+            # close to prev_balance itself (within 1%).
+            if abs(val - prev_balance) / max(prev_balance, 1) < 0.01:
+                # Value ≈ prev_balance → likely a balance echo, not an amount
                 return {"date": date, "description": description,
                         "debit": "", "credit": "", "balance": f"{val:,.2f}"}
             else:
+                # Treat as a transaction amount; debit/credit will be
+                # reclassified when the standalone balance line is detected.
+                # Default to credit (positive); reclassification fixes it.
                 return {"date": date, "description": description,
                         "debit": "", "credit": f"{val:,.2f}", "balance": ""}
         else:
@@ -2624,6 +2808,10 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     if amount_val < 0:
         debit = f"{abs(amount_val):,.2f}"
         credit = ""
+    elif amount_str.startswith("+"):
+        # Explicit + sign → unconditionally credit (Mashreq / WIO style)
+        debit = ""
+        credit = f"{amount_val:,.2f}"
     elif prev_balance is not None:
         # Compare with previous balance to determine direction
         if balance_val < prev_balance:
@@ -2653,9 +2841,10 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
 #   • is at least 6 characters long
 #   • contains at least one digit (so it's not a plain English word)
 #   • is followed by a space and more text (not the entire description)
-# Examples matched: "P104736051", "TXN20240201", "CHQ001234", "REF123456"
+# Examples matched: "P104736051", "TXN20240201", "CHQ001234", "REF123456",
+#                   "030POSB2433302kK", "099REFEAED", "033INCR243450722"
 # Examples NOT matched: "From", "Invoice", "SALARY" (no digits or too short)
-_REF_CODE_RE = re.compile(r"^([A-Za-z]{0,4}\d{6,}[A-Za-z0-9]*)\s+(?=\S)")
+_REF_CODE_RE = re.compile(r"^((?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,})\s+(?=\S)")
 
 
 def _strip_leading_ref(description: str) -> str:
@@ -2666,15 +2855,39 @@ def _strip_leading_ref(description: str) -> str:
 
     Only strips when the first token:
       - is entirely alphanumeric (A-Z, 0-9 only, no spaces or special chars)
-      - contains at least one letter AND at least one digit (looks like a code)
+      - contains at least one digit (looks like a code, not a plain word)
       - is at least 6 characters long
       - is followed by more content (not the whole description)
+
+    Also strips a secondary short numeric sub-code (e.g. "099REFEAED 00002 Desc"
+    → strips both "099REFEAED" and "00002").
+
+    Handles standalone short numeric codes (e.g. "00001 Monthly Maintenance Fee")
+    that appear when the main ref was on a separate line in multi-line transactions.
     """
     m = _REF_CODE_RE.match(description)
     if m:
         remainder = description[m.end():].strip()
         if remainder:  # Only strip if there's still content left
+            # Check for a secondary short numeric code (e.g. "00001", "00002")
+            sub_code = re.match(r"^(\d{3,6})\s+(?=\S)", remainder)
+            if sub_code:
+                after_sub = remainder[sub_code.end():].strip()
+                if after_sub:
+                    return after_sub
+            # If remainder is just a short numeric code with no further text,
+            # strip it too (e.g. "099REFEAED 00002" → both are ref codes)
+            if re.fullmatch(r"\d{3,6}", remainder):
+                return ""
             return remainder
+    # Also handle standalone short numeric sub-codes (e.g. "00001 Monthly Maintenance Fee")
+    # These appear when the main ref code was on a different line in multi-line transactions.
+    sub_code = re.match(r"^(\d{3,6})\s+(?=\S)", description)
+    if sub_code:
+        after_sub = description[sub_code.end():].strip()
+        # Only strip if remaining text starts with a letter (looks like actual description)
+        if after_sub and after_sub[0].isalpha():
+            return after_sub
     return description
 
 
