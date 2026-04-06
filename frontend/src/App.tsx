@@ -448,8 +448,10 @@ function App() {
                             )}
                             {txn.date}
                           </TableCell>
-                          <TableCell className="max-w-md text-sm text-white/70">
-                            <span className="truncate block">{txn.description}</span>
+                          <TableCell className="max-w-xl text-sm text-white/70 align-top">
+                            <span className="block whitespace-pre-wrap break-words leading-6">
+                              {txn.description}
+                            </span>
                           </TableCell>
                           <TableCell className="text-right whitespace-nowrap text-sm font-mono">
                             {txn.debit && (

@@ -243,6 +243,25 @@ _DESC_FOOTER_MARKERS = [
     "account holder name",
     "interest rate",
     "current_account",
+    "available balance as of",
+    "licensed & regulated",
+    "central bank of the uae",
+    "statement date",
+    "online banking - go to relationship summary",
+    "select card>> block card",
+    "phone banking - call",
+    "unauthorized transaction",
+    "wakala deposits is based on wakala contract",
+    "savings account is based on mudaraba contract",
+    "profit calculation, distribution and payment",
+    "complaints management unit",
+    "errors and omissions excepted",
+    "banking / select card>>manage card >> block card",
+    "main menu.",
+    "sharia, as defined in the aaoifi",
+    "sharia standards and the guidance of dib issc",
+    "realization of profit from the underlying investments",
+    "complaint within an estimated average of",
 ]
 # These markers are only truncated when they appear far enough into the text
 # (>= _FOOTER_MIN_POS chars in).  Short descriptions must not be destroyed.
@@ -265,6 +284,38 @@ _COL_HEADER_ROLES = frozenset({
 })
 
 
+def _normalize_multiline_text(value: str) -> str:
+    """Normalize text while preserving meaningful line boundaries."""
+    if not value:
+        return ""
+
+    lines = []
+    for raw_line in str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _append_description(base: str, extra: str) -> str:
+    """Append description text without flattening line breaks."""
+    base = _normalize_multiline_text(base)
+    extra = _normalize_multiline_text(extra)
+    if not base:
+        return extra
+    if not extra:
+        return base
+    return f"{base}\n{extra}"
+
+
+def _is_standalone_amount_line(text: str) -> bool:
+    """True when a text line is just a monetary value, not description text."""
+    if not text:
+        return False
+    normalized = text.strip()
+    return bool(re.fullmatch(r"[+\-]?[\d,]+(?:\.\d{1,2})?", normalized))
+
+
 def _clean_description(description: str) -> str:
     """Strip footer/metadata content merged into a transaction description.
 
@@ -281,6 +332,8 @@ def _clean_description(description: str) -> str:
     if not description:
         return description
 
+    description = _normalize_multiline_text(description)
+
     # 1. Truncate at known footer text markers — only when they appear far enough
     #    into the description that there is meaningful content before the marker.
     desc_lower = description.lower()
@@ -293,12 +346,19 @@ def _clean_description(description: str) -> str:
 
     # 2. Truncate at © or first Arabic character (clearly non-transaction content)
     #    Only if there's enough real content before it.
-    m = _DESC_POISON_RE.search(description)
+    cid_match = re.search(r"(?:\(cid:\d+\)){2,}", description, re.IGNORECASE)
+    m = cid_match or _DESC_POISON_RE.search(description)
     if m and m.start() >= _FOOTER_MIN_POS:
         description = description[:m.start()].strip()
 
     # 3. Strip trailing phone-number-like digit sequences
     description = _TRAILING_PHONE_RE.sub("", description).strip()
+
+    # Drop trailing standalone amount lines that come from summary/footer balances
+    lines = description.split("\n")
+    while len(lines) > 1 and _is_standalone_amount_line(lines[-1]):
+        lines.pop()
+    description = "\n".join(lines).strip()
 
     # 4. Detect consecutive column-header words merged into description.
     #    e.g. "Owais Arshad Khan Amount Balance Date Ref. Number Description..."
@@ -1304,13 +1364,22 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                                     if ci in amount_cols:
                                         continue
                                     txt = cell.strip()
-                                    if txt and len(txt) > 1 and not _is_noise_line(txt):
+                                    if (
+                                        txt
+                                        and len(txt) > 1
+                                        and not _is_noise_line(txt)
+                                        and not _is_standalone_amount_line(txt)
+                                    ):
                                         parts.append(txt)
                                 if parts:
-                                    continuation_text = "/".join(parts)
-                                    transactions[-1]["description"] += "/" + continuation_text
+                                    continuation_text = "\n".join(
+                                        _normalize_multiline_text(p) for p in parts if p
+                                    )
                                     transactions[-1]["description"] = _clean_description(
-                                        transactions[-1]["description"]
+                                        _append_description(
+                                            transactions[-1]["description"],
+                                            continuation_text,
+                                        )
                                     )
 
                         if ri < 3:
@@ -2243,7 +2312,7 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
 
     # Pre-clean description before row-level filters. The first transaction row on
     # each page often carries merged page-header metadata in this cell.
-    description = re.sub(r"\s+", " ", get("description")).strip()
+    description = _normalize_multiline_text(get("description"))
     desc_lower = description.lower()
     header_was_contaminated = (
         any(p.match(description) for p in _DESC_HEADER_RES)
@@ -2423,15 +2492,16 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                         and (top - last_date_y) < 25
                     )
                     if is_continuation:
-                        if not _is_noise_line(line_text):
+                        if not _is_noise_line(line_text) and not _is_standalone_amount_line(line_text):
                             prev = transactions[-1]
                             prev["description"] = _clean_description(
-                                (prev["description"] + " " + line_text).strip()
+                                _append_description(prev["description"], line_text)
                             )
                         last_date_y = top  # Extend the "current transaction" zone
                     else:
-                        pending_desc_lines.append(line_text)
-                    continue
+                        if not _is_standalone_amount_line(line_text):
+                            pending_desc_lines.append(line_text)
+                        continue
 
                 # Date line — extract column values by x-position
                 last_date_y = top
@@ -2485,8 +2555,8 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
 
                 desc = " ".join(description_parts)
                 if pending_desc_lines:
-                    pre = " ".join(pending_desc_lines)
-                    desc = (pre + " " + desc).strip() if desc else pre
+                    pre = "\n".join(_normalize_multiline_text(line) for line in pending_desc_lines if line)
+                    desc = _append_description(pre, desc) if desc else pre
                     pending_desc_lines = []
 
                 balance = _clean_amount(balance)
@@ -2628,8 +2698,30 @@ def _is_noise_line(line: str) -> bool:
         "electronically generated statement", "does not require a signature",
         "no notice of disagreement", "account opened",
         "interest rate", "current_account",
+        "available balance as of", "licensed & regulated",
+        "central bank of the uae",
+        "statement date",
+        "online banking - go to relationship summary",
+        "select card>> block card",
+        "phone banking - call",
+        "unauthorized transaction",
+        "wakala deposits is based on wakala contract",
+        "savings account is based on mudaraba contract",
+        "profit calculation, distribution and payment",
+        "complaints management unit",
+        "errors and omissions excepted",
+        "banking / select card>>manage card >> block card",
+        "main menu.",
+        "sharia, as defined in the aaoifi",
+        "sharia standards and the guidance of dib issc",
+        "realization of profit from the underlying investments",
+        "complaint within an estimated average of",
     ]
     if any(phrase in line_lower for phrase in _noise_phrases):
+        return True
+    if re.match(r"^\d+\s*-\s+", line_lower):
+        return True
+    if re.search(r"(?:\(cid:\d+\)){2,}", line, re.IGNORECASE):
         return True
     # Lines that are ONLY an IBAN number (no other content) are metadata
     # Don't filter lines where IBAN-like refs appear as part of transaction descriptions
@@ -2704,9 +2796,11 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                     if pending_desc_lines and transactions:
                         pre_desc = " ".join(pending_desc_lines)
                         if txn["description"]:
-                            txn["description"] = _clean_description(pre_desc + " " + txn["description"])
+                            txn["description"] = _clean_description(
+                                _append_description(pre_desc, txn["description"])
+                            )
                         else:
-                            txn["description"] = pre_desc
+                            txn["description"] = _normalize_multiline_text(pre_desc)
                     pending_desc_lines = []
 
                     transactions.append(txn)
@@ -2754,13 +2848,12 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                                     pass
                             prev_balance = new_balance
                         else:
-                            if not _is_noise_line(line):
+                            if not _is_noise_line(line) and not _is_standalone_amount_line(line):
                                 prev["description"] = _clean_description(
-                                    (prev["description"] + " " + line).strip()
-                                    if prev["description"] else line
+                                    _append_description(prev["description"], line)
                                 )
                     else:
-                        if not _is_noise_line(line):
+                        if not _is_noise_line(line) and not _is_standalone_amount_line(line):
                             pending_desc_lines.append(line)
 
     return transactions
@@ -3042,10 +3135,7 @@ def _clean_table(table: list[list]) -> list[list[str]]:
     for row in table:
         if row is None:
             continue
-        cleaned_row = [
-            (str(cell).strip().replace("\n", " ") if cell else "")
-            for cell in row
-        ]
+        cleaned_row = [_normalize_multiline_text(cell) if cell else "" for cell in row]
         if any(cell for cell in cleaned_row):
             cleaned.append(cleaned_row)
     return cleaned
