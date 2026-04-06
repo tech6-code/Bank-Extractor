@@ -234,6 +234,15 @@ _DESC_FOOTER_MARKERS = [
     "electronically generated statement", "registered details: emirates",
     "no notice of disagreement", "paid up capital",
     "tax registration number",
+    # Additional metadata phrases that appear mid-description when rows are merged
+    "please review this account statement",
+    "if no issues are reported",
+    "this bank is regulated",
+    "account statement from",
+    "account opened",
+    "account holder name",
+    "interest rate",
+    "current_account",
 ]
 # These markers are only truncated when they appear far enough into the text
 # (>= _FOOTER_MIN_POS chars in).  Short descriptions must not be destroyed.
@@ -335,14 +344,82 @@ def _strip_page_header_prefix(description: str) -> str:
     but tries a fallback: skip past the header-trigger pattern itself and
     return whatever follows.
     """
-    # Limit search to the first 200 chars so that words like "Branch" or "Currency"
+    # Limit search to the first 400 chars so that words like "Branch" or "Currency"
     # appearing inside the real description don't cause a false truncation point.
-    search_in = description[:200]
+    search_in = description[:400]
     matches = list(_PAGE_META_FIELD_RE.finditer(search_in))
+
+    # Also look for bare IBANs (e.g. "AE60086000009098870202") as boundary markers —
+    # many statements embed the IBAN without the "IBAN" prefix.
+    bare_iban_matches = list(_IBAN_RE.finditer(search_in))
+    if bare_iban_matches:
+        matches.extend(bare_iban_matches)
+        matches.sort(key=lambda m: m.end())
+
     if matches:
+        # Use the LAST metadata-field match as the boundary; everything after it
+        # is the real description.  But first skip any trailing amounts / currency
+        # codes / percentages / dates that are part of the header metadata.
         remainder = description[matches[-1].end():].strip()
+        # Strip leading noise tokens: amounts (123.45), percentages (0%),
+        # currency codes (AED), dates (08/10/2022), and common header words
+        remainder = re.sub(
+            r"^(?:"
+            r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"     # dates (try first — avoids partial match)
+            r"|[\d,.]+%?"                               # amounts / percentages
+            r"|[A-Z]{2,4}"                              # currency codes
+            r"|(?:please\s+review|if\s+no\s+issues)"   # header phrases
+            r"|\s+"
+            r")+",
+            "", remainder, flags=re.IGNORECASE
+        ).strip()
         if len(remainder) > 3:
-            return remainder
+            # If the remainder is still very long and contaminated, try the
+            # column-header-run approach below before returning.
+            if len(remainder) < 200:
+                return remainder
+
+    # Reverse search: find the LAST column-header run (e.g. "Amount Balance Date
+    # Ref. Number Description") and return everything after it.  This handles cases
+    # where the entire text is header metadata followed by column headers followed
+    # by the real transaction description at the very end.
+    words = description.split()
+    last_run_end: int | None = None
+    run_start_idx: int | None = None
+    run_len = 0
+    for i, word in enumerate(words):
+        clean_word = re.sub(r"[^A-Za-z0-9.]", "", word)
+        role, conf = classify_column_header(clean_word)
+        if conf >= 0.85 and role in _COL_HEADER_ROLES:
+            if run_start_idx is None:
+                run_start_idx = i
+            run_len += 1
+            if run_len >= 3:
+                last_run_end = i + 1  # Track the end of this run
+        else:
+            run_start_idx = None
+            run_len = 0
+
+    if last_run_end is not None and last_run_end < len(words):
+        # Continue past straggler header-adjacent words (e.g. "Number" after "Ref.",
+        # or "Description" which is a column header but broke the run detection).
+        skip_idx = last_run_end
+        _extra_header_words = {
+            "number", "no", "no.", "ref", "ref.", "reference",
+            "description", "amount", "date", "balance",
+            "type", "details", "particular", "particulars",
+        }
+        while skip_idx < len(words):
+            w = words[skip_idx].strip("(),.").lower()
+            if w in _extra_header_words:
+                skip_idx += 1
+            else:
+                break
+        after_headers = " ".join(words[skip_idx:]).strip()
+        # Skip parenthetical qualifiers like "(Incl. VAT)" or "(AED)"
+        after_headers = re.sub(r"^(?:\s*\([^)]*\)\s*)+", "", after_headers).strip()
+        if len(after_headers) > 3:
+            return after_headers
 
     # Fallback: skip past the header-trigger pattern that flagged this as contaminated.
     # e.g. "Account statement Salary Transfer From XYZ" → "Salary Transfer From XYZ"
@@ -1227,11 +1304,14 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                                     if ci in amount_cols:
                                         continue
                                     txt = cell.strip()
-                                    if txt and len(txt) > 1:
+                                    if txt and len(txt) > 1 and not _is_noise_line(txt):
                                         parts.append(txt)
                                 if parts:
                                     continuation_text = "/".join(parts)
                                     transactions[-1]["description"] += "/" + continuation_text
+                                    transactions[-1]["description"] = _clean_description(
+                                        transactions[-1]["description"]
+                                    )
 
                         if ri < 3:
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: REJECTED (returned None), row={[c[:40] for c in row]}")
@@ -2204,6 +2284,9 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     # pdfplumber merged the ref-number column into the description column)
     description = _strip_leading_ref(description)
 
+    # Clean merged footer/metadata content from description
+    description = _clean_description(description)
+
     return {
         "date": date,
         "description": description,
@@ -2340,8 +2423,11 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                         and (top - last_date_y) < 25
                     )
                     if is_continuation:
-                        prev = transactions[-1]
-                        prev["description"] = (prev["description"] + " " + line_text).strip()
+                        if not _is_noise_line(line_text):
+                            prev = transactions[-1]
+                            prev["description"] = _clean_description(
+                                (prev["description"] + " " + line_text).strip()
+                            )
                         last_date_y = top  # Extend the "current transaction" zone
                     else:
                         pending_desc_lines.append(line_text)
@@ -2419,6 +2505,9 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
 
                 # Strip leading reference codes from description
                 desc = _strip_leading_ref(desc)
+
+                # Clean merged footer/metadata content from description
+                desc = _clean_description(desc)
 
                 # Only apply SKIP_PHRASES when NOT header-contaminated
                 if not header_contaminated:
@@ -2525,9 +2614,22 @@ def _is_noise_line(line: str) -> bool:
         return True
     if "account type" in line_lower or "account number" in line_lower:
         return True
+    if "account holder" in line_lower:
+        return True
     if "current account transactions" in line_lower:
         return True
     if line_lower.startswith("iban:") or line_lower.startswith("branch:") or line_lower.startswith("currency:"):
+        return True
+    # Soft-skip phrases that are clearly metadata, not transaction descriptions
+    _noise_phrases = [
+        "account statement from", "please review this account statement",
+        "if no issues are reported", "this bank is regulated",
+        "confirmation of the correctness", "correctness of the statement",
+        "electronically generated statement", "does not require a signature",
+        "no notice of disagreement", "account opened",
+        "interest rate", "current_account",
+    ]
+    if any(phrase in line_lower for phrase in _noise_phrases):
         return True
     # Lines that are ONLY an IBAN number (no other content) are metadata
     # Don't filter lines where IBAN-like refs appear as part of transaction descriptions
@@ -2602,7 +2704,7 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                     if pending_desc_lines and transactions:
                         pre_desc = " ".join(pending_desc_lines)
                         if txn["description"]:
-                            txn["description"] = pre_desc + " " + txn["description"]
+                            txn["description"] = _clean_description(pre_desc + " " + txn["description"])
                         else:
                             txn["description"] = pre_desc
                     pending_desc_lines = []
@@ -2652,12 +2754,14 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                                     pass
                             prev_balance = new_balance
                         else:
-                            prev["description"] = (
-                                (prev["description"] + " " + line).strip()
-                                if prev["description"] else line
-                            )
+                            if not _is_noise_line(line):
+                                prev["description"] = _clean_description(
+                                    (prev["description"] + " " + line).strip()
+                                    if prev["description"] else line
+                                )
                     else:
-                        pending_desc_lines.append(line)
+                        if not _is_noise_line(line):
+                            pending_desc_lines.append(line)
 
     return transactions
 
