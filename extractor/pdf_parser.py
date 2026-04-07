@@ -20,6 +20,8 @@ DATE_PATTERNS = [
     re.compile(r"\b(\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2})\b"),
     # DD/MM/YY or MM/DD/YY      (2-digit year)
     re.compile(r"\b(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2})\b"),
+    # DDMONYY / DMONYY / DDMONTHYYYY  e.g. "31DEC24", "2JAN25", "15JANUARY2025"
+    re.compile(rf"\b(\d{{1,2}}{_MONTH}\d{{2,4}})\b", re.IGNORECASE),
     # D Mon YYYY / D Month YYYY  e.g. "1 Jan 2024", "15 January 2024"
     re.compile(rf"\b(\d{{1,2}}\s+{_MONTH}\s+\d{{4}})\b", re.IGNORECASE),
     # D-Mon-YYYY / D/Mon/YYYY    e.g. "4-Nov-2025", "4/Nov/2025"
@@ -37,6 +39,7 @@ DATE_PATTERNS = [
 DATE_START_RE = re.compile(
     rf"^\d{{1,2}}[/\-.](\d{{1,2}}|{_MONTH})[/\-.]\d{{2,4}}"
     rf"|^\d{{4}}[/\-.]\d{{1,2}}[/\-.]\d{{1,2}}"
+    rf"|^\d{{1,2}}{_MONTH}\d{{2,4}}"
     rf"|^\d{{1,2}}\s+{_MONTH}\s+\d{{2,4}}"
     rf"|^{_MONTH}",
     re.IGNORECASE,
@@ -48,6 +51,7 @@ FLEX_AMOUNT_RE = re.compile(r"-?[\d,]+(?:\.\d{1,2})?$")
 # For finding amounts in text lines (must be whitespace-bounded)
 # Captures optional +/- prefix so Mashreq-style "+2.00" amounts are recognised.
 TEXT_AMOUNT_RE = re.compile(r"(?:^|\s)([+\-]?[\d,]+(?:\.\d{1,2})?)(?=\s|$)")
+CELL_AMOUNT_RE = re.compile(r"[+\-]?[\d,]+\.\d{1,2}")
 
 # ── Universal Column Keyword Sets ─────────────────────────────────────────────
 # Covers major banks: US, UK, India, Middle East, Southeast Asia, Africa, etc.
@@ -314,6 +318,20 @@ def _is_standalone_amount_line(text: str) -> bool:
         return False
     normalized = text.strip()
     return bool(re.fullmatch(r"[+\-]?[\d,]+(?:\.\d{1,2})?", normalized))
+
+
+def _count_date_matches(text: str) -> int:
+    """Count distinct date-like spans inside a cell."""
+    spans: set[tuple[int, int]] = set()
+    for pattern in DATE_PATTERNS:
+        for match in pattern.finditer(text or ""):
+            spans.add((match.start(), match.end()))
+    return len(spans)
+
+
+def _count_amount_matches(text: str) -> int:
+    """Count amount-like substrings inside a cell."""
+    return len(CELL_AMOUNT_RE.findall(text or ""))
 
 
 def _clean_description(description: str) -> str:
@@ -2282,6 +2300,20 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     if any(len(str(c)) > 2000 for c in row):
         logger.debug(f"Row rejected (cell >2000 chars): {[c[:40] for c in row]}")
         return None
+
+    raw_date_cell = get("date")
+    if _count_date_matches(raw_date_cell) > 1:
+        logger.debug(f"Row rejected (multiple dates in date cell): {raw_date_cell[:120]!r}")
+        return None
+
+    for amount_key in ("debit", "credit", "balance", "amount"):
+        raw_amount_cell = get(amount_key)
+        if _count_amount_matches(raw_amount_cell) > 1:
+            logger.debug(
+                f"Row rejected (multiple amounts in {amount_key} cell): "
+                f"{raw_amount_cell[:120]!r}"
+            )
+            return None
 
     # Date check first so we can skip non-transaction rows quickly.
     date = get("date")
