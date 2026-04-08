@@ -295,7 +295,7 @@ async def debug_pdf(file: UploadFile, password: str | None = Form(default=None))
 
 
 @app.post("/api/download/{file_id}")
-async def download_excel(file_id: str):
+async def download_excel(file_id: str, swap_row_indices: str = ""):
     """Convert a previously uploaded PDF to Excel and return the file."""
     xlsx_path = TEMP_DIR / f"{file_id}.xlsx"
 
@@ -310,10 +310,24 @@ async def download_excel(file_id: str):
             transactions, _ = _separate_meta(raw)
             _cache_put(file_id, transactions)
 
+        swap_indices = {
+            int(raw_idx)
+            for raw_idx in swap_row_indices.split(",")
+            if raw_idx.strip().isdigit()
+        }
+        export_transactions = [
+            {
+                **txn,
+                "debit": txn["credit"],
+                "credit": txn["debit"],
+            } if idx in swap_indices else txn
+            for idx, txn in enumerate(transactions)
+        ]
+
         # Build a single table: header row + data rows
         table = [COLUMNS] + [
             [txn["date"], txn["description"], txn["debit"], txn["credit"], txn["balance"]]
-            for txn in transactions
+            for txn in export_transactions
         ]
         write_tables_to_excel([table], str(xlsx_path))
     except HTTPException:

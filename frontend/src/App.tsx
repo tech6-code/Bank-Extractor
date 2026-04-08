@@ -1,4 +1,5 @@
 import { useState, useCallback, useMemo, type DragEvent } from "react";
+import { ArrowLeftRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -64,20 +65,37 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [swappedRowKeys, setSwappedRowKeys] = useState<Set<string>>(new Set());
   const [pdfPassword, setPdfPassword] = useState("");
   const [result, setResult] = useState<ExtractResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
 
-  const totalPages = result
-    ? Math.ceil(result.transactions.length / ROWS_PER_PAGE)
+  const rowKey = useCallback((txn: Transaction, index: number) => (
+    `${index}::${txn.date}::${txn.description}::${txn.debit}::${txn.credit}::${txn.balance}`
+  ), []);
+
+  const displayTransactions = useMemo(() => {
+    if (!result) return [];
+    return result.transactions.map((txn, index) => {
+      if (!swappedRowKeys.has(rowKey(txn, index))) return txn;
+      return {
+        ...txn,
+        debit: txn.credit,
+        credit: txn.debit,
+      };
+    });
+  }, [result, rowKey, swappedRowKeys]);
+
+  const totalPages = displayTransactions.length > 0
+    ? Math.ceil(displayTransactions.length / ROWS_PER_PAGE)
     : 0;
 
   const paginatedRows = useMemo(() => {
-    if (!result) return [];
+    if (!displayTransactions.length) return [];
     const start = (page - 1) * ROWS_PER_PAGE;
-    return result.transactions.slice(start, start + ROWS_PER_PAGE);
-  }, [result, page]);
+    return displayTransactions.slice(start, start + ROWS_PER_PAGE);
+  }, [displayTransactions, page]);
 
   // Set of row indices that failed balance validation (for highlighting)
   const mismatchRows = useMemo(() => {
@@ -86,20 +104,20 @@ function App() {
   }, [result]);
 
   const stats = useMemo(() => {
-    if (!result) return null;
+    if (!displayTransactions.length) return null;
     let totalDebit = 0;
     let totalCredit = 0;
-    for (const t of result.transactions) {
+    for (const t of displayTransactions) {
       if (t.debit) totalDebit += parseFloat(t.debit.replace(/,/g, "")) || 0;
       if (t.credit) totalCredit += parseFloat(t.credit.replace(/,/g, "")) || 0;
     }
     return {
       totalDebit,
       totalCredit,
-      debitCount: result.transactions.filter((t) => t.debit).length,
-      creditCount: result.transactions.filter((t) => t.credit).length,
+      debitCount: displayTransactions.filter((t) => t.debit).length,
+      creditCount: displayTransactions.filter((t) => t.credit).length,
     };
-  }, [result]);
+  }, [displayTransactions]);
 
   const handleUpload = useCallback(async (file: File) => {
     setError(null);
@@ -123,6 +141,7 @@ function App() {
       }
 
       const data: ExtractResult = await res.json();
+      setSwappedRowKeys(new Set());
       setResult(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -137,7 +156,13 @@ function App() {
     setIsDownloading(true);
 
     try {
-      const res = await fetch(`${API_BASE}/api/download/${result.file_id}`, {
+      const params = new URLSearchParams();
+      const swappedRows = result.transactions
+        .map((txn, index) => swappedRowKeys.has(rowKey(txn, index)) ? String(index) : null)
+        .filter((value): value is string => value !== null);
+      if (swappedRows.length > 0) params.set("swap_row_indices", swappedRows.join(","));
+      const downloadUrl = `${API_BASE}/api/download/${result.file_id}${params.size ? `?${params.toString()}` : ""}`;
+      const res = await fetch(downloadUrl, {
         method: "POST",
       });
       if (!res.ok) throw new Error("Download failed");
@@ -154,7 +179,20 @@ function App() {
     } finally {
       setIsDownloading(false);
     }
-  }, [result]);
+  }, [result, rowKey, swappedRowKeys]);
+
+  const toggleRowSwap = useCallback((txn: Transaction, globalIdx: number) => {
+    const key = rowKey(txn, globalIdx);
+    setSwappedRowKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  }, [rowKey]);
 
   const onDragOver = (e: DragEvent) => {
     e.preventDefault();
@@ -334,6 +372,22 @@ function App() {
               </div>
             )}
 
+            <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+              <p className="text-sm font-medium text-white/70">Review Controls</p>
+              <p className="text-xs text-white/35">
+                Use the swap icon on each transaction row to flip only that row&apos;s debit and credit values for review or export.
+              </p>
+            </div>
+
+            {swappedRowKeys.size > 0 && result.validation && result.validation.validated_rows > 0 && (
+              <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+                <p className="text-sm font-medium text-amber-200">Some transaction rows currently have debit and credit swapped for review.</p>
+                <p className="mt-1 text-xs text-amber-200/70">
+                  Balance validation still reflects the original extraction values.
+                </p>
+              </div>
+            )}
+
             {/* Stats bar */}
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <StatCard
@@ -444,6 +498,7 @@ function App() {
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Debit</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Credit</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Balance</TableHead>
+                      <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-center">Swap</TableHead>
                       {result.validation?.row_variances && (
                         <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right pr-5">Variance</TableHead>
                       )}
@@ -453,6 +508,7 @@ function App() {
                     {paginatedRows.map((txn, i) => {
                       const globalIdx = (page - 1) * ROWS_PER_PAGE + i;
                       const isMismatch = mismatchRows.has(globalIdx);
+                      const isRowSwapped = result ? swappedRowKeys.has(rowKey(result.transactions[globalIdx], globalIdx)) : false;
                       return (
                         <TableRow
                           key={`${txn.date}-${txn.balance}-${i}`}
@@ -483,9 +539,25 @@ function App() {
                             )}
                           </TableCell>
                           <TableCell className={`text-right whitespace-nowrap text-sm font-mono ${
-                            !result.validation?.row_variances ? "pr-5" : ""
+                            !result.validation?.row_variances ? "" : ""
                           } ${isMismatch ? "text-amber-400" : "text-white/60"}`}>
                             {txn.balance}
+                          </TableCell>
+                          <TableCell className="text-center">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => result && toggleRowSwap(result.transactions[globalIdx], globalIdx)}
+                              className={`h-8 w-8 p-0 ${
+                                isRowSwapped
+                                  ? "text-indigo-300 bg-indigo-500/15 hover:bg-indigo-500/20"
+                                  : "text-white/40 hover:text-white/70 hover:bg-white/[0.04]"
+                              }`}
+                              title={isRowSwapped ? "Show original values" : "Swap debit and credit for this row"}
+                            >
+                              <ArrowLeftRight className="h-4 w-4" />
+                            </Button>
                           </TableCell>
                           {result.validation?.row_variances && (() => {
                             const variance = result.validation.row_variances?.[globalIdx];
