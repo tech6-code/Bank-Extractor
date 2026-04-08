@@ -2404,7 +2404,6 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     desc_lower = description.lower()
     header_was_contaminated = (
         any(p.match(description) for p in _DESC_HEADER_RES)
-        or bool(_IBAN_RE.search(description[:140]))
         or (
             len(description) > 80
             and (
@@ -2742,6 +2741,8 @@ def _is_noise_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return True
+    if re.match(r"^(?:REF#|/REF/|//REC/|SRN:)", stripped, re.IGNORECASE):
+        return False
     line_lower = line.lower()
     # Skip known non-content lines
     if any(phrase in line_lower for phrase in SKIP_PHRASES):
