@@ -64,6 +64,7 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [pdfPassword, setPdfPassword] = useState("");
   const [result, setResult] = useState<ExtractResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
@@ -108,6 +109,7 @@ function App() {
 
     const formData = new FormData();
     formData.append("file", file);
+    if (pdfPassword.trim()) formData.append("password", pdfPassword);
 
     try {
       const res = await fetch(`${API_BASE}/api/extract`, {
@@ -126,8 +128,9 @@ function App() {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
       setIsLoading(false);
+      setPdfPassword("");
     }
-  }, []);
+  }, [pdfPassword]);
 
   const handleDownload = useCallback(async () => {
     if (!result) return;
@@ -208,6 +211,22 @@ function App() {
 
         {/* Upload area */}
         <div className="mb-6">
+          <div className="mb-3">
+            <label className="mb-2 block text-xs font-medium uppercase tracking-[0.18em] text-white/40">
+              PDF Password
+            </label>
+            <input
+              type="password"
+              value={pdfPassword}
+              onChange={(e) => setPdfPassword(e.target.value)}
+              placeholder="Optional. Required only for protected PDFs"
+              className="w-full rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+              disabled={isLoading}
+            />
+            <p className="mt-2 text-xs text-white/30">
+              If the uploaded bank statement PDF is password protected, enter the PDF password here before uploading.
+            </p>
+          </div>
           <label
             htmlFor="file-upload"
             className={`group relative flex flex-col items-center justify-center rounded-2xl border cursor-pointer transition-all duration-300 overflow-hidden ${

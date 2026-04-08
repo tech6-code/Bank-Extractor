@@ -12,11 +12,12 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+import fitz
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel
@@ -51,8 +52,8 @@ def _purge_stale_files() -> None:
 
 def _cleanup_after_download(file_id: str) -> None:
     """Delete the PDF and XLSX for a file_id and evict from cache."""
-    for ext in (".pdf", ".xlsx"):
-        (TEMP_DIR / f"{file_id}{ext}").unlink(missing_ok=True)
+    for suffix in (".pdf", "_unlocked.pdf", ".xlsx"):
+        (TEMP_DIR / f"{file_id}{suffix}").unlink(missing_ok=True)
     _cache.pop(file_id, None)
 
 
@@ -101,8 +102,42 @@ def _separate_meta(transactions: list[dict]) -> tuple[list[dict], dict | None]:
     return transactions, None
 
 
+def _get_working_pdf_path(file_id: str) -> Path:
+    """Return the unlocked temp PDF when available, otherwise the original upload."""
+    unlocked_path = TEMP_DIR / f"{file_id}_unlocked.pdf"
+    if unlocked_path.exists():
+        return unlocked_path
+    return TEMP_DIR / f"{file_id}.pdf"
+
+
+def _prepare_working_pdf(pdf_path: Path, password: str | None, file_id: str) -> Path:
+    """Return a readable PDF path, creating an unlocked working copy if needed."""
+    unlocked_path = TEMP_DIR / f"{file_id}_unlocked.pdf"
+    doc = fitz.open(str(pdf_path))
+    try:
+        if not doc.needs_pass:
+            return pdf_path
+
+        if not password:
+            raise HTTPException(422, "This PDF is password protected. Please enter the PDF password.")
+
+        if doc.authenticate(password) <= 0:
+            raise HTTPException(422, "Incorrect PDF password.")
+
+        unlocked_doc = fitz.open()
+        try:
+            unlocked_doc.insert_pdf(doc)
+            unlocked_doc.save(str(unlocked_path))
+        finally:
+            unlocked_doc.close()
+
+        return unlocked_path
+    finally:
+        doc.close()
+
+
 @app.post("/api/extract")
-async def extract_preview(file: UploadFile):
+async def extract_preview(file: UploadFile, password: str | None = Form(default=None)):
     """Upload a PDF and return extracted transaction data as JSON."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
@@ -115,28 +150,40 @@ async def extract_preview(file: UploadFile):
         raise HTTPException(413, f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)} MB.")
     TEMP_DIR.mkdir(exist_ok=True)
     pdf_path.write_bytes(content)
+    working_pdf_path = pdf_path
 
     try:
         logger.info(f"Extracting transactions from {file.filename} ({len(content)} bytes)")
+        working_pdf_path = _prepare_working_pdf(pdf_path, password, file_id)
 
         # ── Template matching ─────────────────────────────────────────────
         template = None
         try:
-            template = match_template(str(pdf_path))
+            template = match_template(str(working_pdf_path))
         except Exception as e:
             logger.warning(f"Template matching failed (continuing without): {e}")
 
         # ── Extraction ────────────────────────────────────────────────────
-        raw_transactions = extract_transactions(str(pdf_path), template=template)
+        raw_transactions = extract_transactions(str(working_pdf_path), template=template)
         transactions, meta = _separate_meta(raw_transactions)
         logger.info(f"Extracted {len(transactions)} transactions")
+    except HTTPException:
+        logger.exception("Extraction failed")
+        pdf_path.unlink(missing_ok=True)
+        if working_pdf_path != pdf_path:
+            working_pdf_path.unlink(missing_ok=True)
+        raise
     except Exception as e:
         logger.exception("Extraction failed")
         pdf_path.unlink(missing_ok=True)
+        if working_pdf_path != pdf_path:
+            working_pdf_path.unlink(missing_ok=True)
         raise HTTPException(500, f"Failed to extract data: {e}")
 
     if not transactions:
         pdf_path.unlink(missing_ok=True)
+        if working_pdf_path != pdf_path:
+            working_pdf_path.unlink(missing_ok=True)
         raise HTTPException(422, "No transaction data found in the PDF. The parser could not detect structured tables or date-prefixed transaction lines.")
 
     # ── Save template if this was a new layout ────────────────────────────
@@ -154,7 +201,7 @@ async def extract_preview(file: UploadFile):
                 col_map = meta.get("col_map", {})
                 strategy = meta.get("strategy", "unknown")
                 template_id = save_extraction_template(
-                    pdf_path=str(pdf_path),
+                    pdf_path=str(working_pdf_path),
                     col_map=col_map,
                     strategy=strategy,
                     transactions_count=len(transactions),
@@ -163,7 +210,7 @@ async def extract_preview(file: UploadFile):
                     template_info["template_id"] = template_id
                     template_info["template_saved"] = True
                     # Detect bank name for the response
-                    bank_name = detect_bank_name(str(pdf_path))
+                    bank_name = detect_bank_name(str(working_pdf_path))
                     if bank_name:
                         template_info["template_bank_name"] = bank_name
                     logger.info(f"New template saved (id={template_id}, bank={bank_name or 'unknown'})")
@@ -191,19 +238,22 @@ async def extract_preview(file: UploadFile):
 
 
 @app.post("/api/debug")
-async def debug_pdf(file: UploadFile):
+async def debug_pdf(file: UploadFile, password: str | None = Form(default=None)):
     """Upload a PDF and return raw extraction info for debugging."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
 
     content = await file.read()
-    tmp_path = TEMP_DIR / f"debug_{uuid.uuid4().hex}.pdf"
+    debug_id = f"debug_{uuid.uuid4().hex}"
+    tmp_path = TEMP_DIR / f"{debug_id}.pdf"
     tmp_path.write_bytes(content)
+    working_pdf_path = tmp_path
 
     result = {"filename": file.filename, "size_bytes": len(content), "pages": []}
 
     try:
-        with pdfplumber.open(tmp_path) as pdf:
+        working_pdf_path = _prepare_working_pdf(tmp_path, password, debug_id)
+        with pdfplumber.open(working_pdf_path) as pdf:
             total_pages = len(pdf.pages)
             result["total_pages"] = total_pages
 
@@ -238,6 +288,8 @@ async def debug_pdf(file: UploadFile):
         result["error"] = str(e)
     finally:
         tmp_path.unlink(missing_ok=True)
+        if working_pdf_path != tmp_path:
+            working_pdf_path.unlink(missing_ok=True)
 
     return result
 
@@ -251,7 +303,7 @@ async def download_excel(file_id: str):
         transactions = _cache.get(file_id)
         if transactions is None:
             # Cache miss (e.g. server restarted) — re-extract from the saved PDF
-            pdf_path = TEMP_DIR / f"{file_id}.pdf"
+            pdf_path = _get_working_pdf_path(file_id)
             if not pdf_path.exists():
                 raise HTTPException(404, "File not found. Please re-upload.")
             raw = extract_transactions(str(pdf_path))

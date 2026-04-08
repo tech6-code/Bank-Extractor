@@ -193,7 +193,7 @@ _SOFT_SKIP_PHRASES = [
 ]
 
 # Regex to detect IBAN numbers in description text (clear sign of a header dump)
-_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{15,}\b")
+_IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{12,}\b")
 
 # Description starts with these → page header content was merged in by pdfplumber.
 # We try to strip the header prefix and recover the real description; only skip the
@@ -266,6 +266,12 @@ _DESC_FOOTER_MARKERS = [
     "sharia standards and the guidance of dib issc",
     "realization of profit from the underlying investments",
     "complaint within an estimated average of",
+    # Mashreqbank-specific footer phrases
+    "report any discrepancies",
+    "all charges, terms and conditions",
+    "please note that for foreign currency",
+    "subject to change",
+    "indicative only",
 ]
 # These markers are only truncated when they appear far enough into the text
 # (>= _FOOTER_MIN_POS chars in).  Short descriptions must not be destroyed.
@@ -352,15 +358,17 @@ def _clean_description(description: str) -> str:
 
     description = _normalize_multiline_text(description)
 
-    # 1. Truncate at known footer text markers — only when they appear far enough
-    #    into the description that there is meaningful content before the marker.
+    # 1. Truncate at the EARLIEST known footer text marker — only when it appears
+    #    far enough into the description that there is meaningful content before it.
     desc_lower = description.lower()
+    earliest_cut = len(description)
     for marker in _DESC_FOOTER_MARKERS:
         idx = desc_lower.find(marker)
-        if idx >= _FOOTER_MIN_POS:
-            description = description[:idx].strip()
-            desc_lower = description.lower()
-            break
+        if idx >= _FOOTER_MIN_POS and idx < earliest_cut:
+            earliest_cut = idx
+    if earliest_cut < len(description):
+        description = description[:earliest_cut].strip()
+        desc_lower = description.lower()
 
     # 2. Truncate at © or first Arabic character (clearly non-transaction content)
     #    Only if there's enough real content before it.
@@ -376,6 +384,17 @@ def _clean_description(description: str) -> str:
     lines = description.split("\n")
     while len(lines) > 1 and _is_standalone_amount_line(lines[-1]):
         lines.pop()
+
+    # Filter out individual noise lines from multiline descriptions.
+    # This catches footer/header lines that were merged as continuation rows.
+    if len(lines) > 1:
+        cleaned_lines = []
+        for ln in lines:
+            if _is_noise_line(ln):
+                continue
+            cleaned_lines.append(ln)
+        lines = cleaned_lines if cleaned_lines else lines[:1]
+
     description = "\n".join(lines).strip()
 
     # 4. Detect consecutive column-header words merged into description.
@@ -1365,11 +1384,15 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                             logger.info(f"Page {page_num}, table {ti}, row {ri}: EXTRACTED txn #{len(transactions)}: date={txn['date']}, desc={txn['description'][:50]!r}, debit={txn['debit']}, credit={txn['credit']}, balance={txn['balance']}")
                     else:
                         # Check if this is a continuation row (no date but has description text).
-                        # Merge ALL non-date, non-amount text into the previous transaction's description.
+                        # Merge non-date, non-amount text into the previous transaction's description.
+                        # Cap at 8 continuation lines to prevent runaway merging of
+                        # footer/next-transaction text into a single description.
+                        _MAX_CONTINUATION_LINES = 8
                         if transactions:
                             date_idx = effective_map.get("date", 0)
                             date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
-                            if not date_cell:
+                            cur_desc_lines = transactions[-1]["description"].count("\n") + 1 if transactions[-1]["description"] else 0
+                            if not date_cell and cur_desc_lines < _MAX_CONTINUATION_LINES:
                                 # Collect text from all non-financial columns
                                 amount_cols = {
                                     effective_map.get(k)
@@ -1388,6 +1411,13 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                                         and not _is_noise_line(txt)
                                         and not _is_standalone_amount_line(txt)
                                     ):
+                                        # IBAN at start of continuation text signals a new
+                                        # transaction reference (SWIFT format /GB51NWBK...),
+                                        # not a continuation of the current description.
+                                        stripped_txt = txt.lstrip("/")
+                                        if _IBAN_RE.match(stripped_txt):
+                                            parts = []  # discard — belongs to next txn
+                                            break
                                         parts.append(txt)
                                 if parts:
                                     continuation_text = "\n".join(
@@ -2683,11 +2713,17 @@ def _detect_word_columns(words: list[dict]) -> dict | None:
 
 def _is_noise_line(line: str) -> bool:
     """Check if a line is noise (headers, footers, metadata) — not transaction content."""
+    stripped = line.strip()
+    if not stripped:
+        return True
     line_lower = line.lower()
     # Skip known non-content lines
     if any(phrase in line_lower for phrase in SKIP_PHRASES):
         return True
-    if line_lower.startswith("page ") or line_lower.startswith("page["):
+    if line_lower.startswith("page ") or line_lower.startswith("page[") or re.match(r"^page\d", line_lower):
+        return True
+    # Very short single-word lines that are clearly metadata, not descriptions
+    if stripped.rstrip(".") in ("accurate", "verified"):
         return True
     # Lines that are mostly non-ASCII (Arabic/other scripts) with no useful ASCII content
     ascii_chars = sum(1 for c in line if c.isascii() and c.isalnum())
@@ -2701,11 +2737,13 @@ def _is_noise_line(line: str) -> bool:
         return True
     # Common footer patterns — only match when the line is short (clearly metadata,
     # not a transaction description mentioning a bank name)
-    if len(line) < 80:
-        if ("regulated" in line_lower and "licensed" in line_lower):
+    if len(line) < 120:
+        if ("regulated" in line_lower and ("licensed" in line_lower or "central bank" in line_lower or "is regulated" in line_lower)):
             return True
-    # Page number patterns like "[52] نم [2] ةحفص" or "Page [2] of [52]"
+    # Page number patterns like "[52] نم [2] ةحفص" or "Page [2] of [52]" or "page1 of8"
     if re.search(r"\[\d+\]\s*(of|نم)\s*\[\d+\]", line, re.IGNORECASE):
+        return True
+    if re.search(r"\bpage\s*\d+\s*of\s*\d+\b", line, re.IGNORECASE):
         return True
     # Page header / metadata lines
     if "your bank statement" in line_lower:
@@ -2748,6 +2786,13 @@ def _is_noise_line(line: str) -> bool:
         "sharia standards and the guidance of dib issc",
         "realization of profit from the underlying investments",
         "complaint within an estimated average of",
+        # Mashreqbank-specific
+        "report any discrepancies",
+        "all charges, terms and conditions",
+        "please note that for foreign currency",
+        "subject to change",
+        "indicative only",
+        "central bank of the united arab emirates",
     ]
     if any(phrase in line_lower for phrase in _noise_phrases):
         return True
@@ -2880,12 +2925,20 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                                     pass
                             prev_balance = new_balance
                         else:
-                            if not _is_noise_line(line) and not _is_standalone_amount_line(line):
+                            # IBAN at start → new transaction reference, not continuation
+                            line_stripped_slash = line.lstrip("/")
+                            if _IBAN_RE.match(line_stripped_slash):
+                                pending_desc_lines = []
+                            elif not _is_noise_line(line) and not _is_standalone_amount_line(line):
                                 prev["description"] = _clean_description(
                                     _append_description(prev["description"], line)
                                 )
                     else:
-                        if not _is_noise_line(line) and not _is_standalone_amount_line(line):
+                        # IBAN at start → new transaction reference, not continuation
+                        line_stripped_slash = line.lstrip("/")
+                        if _IBAN_RE.match(line_stripped_slash):
+                            pending_desc_lines = []
+                        elif not _is_noise_line(line) and not _is_standalone_amount_line(line):
                             pending_desc_lines.append(line)
 
     return transactions
