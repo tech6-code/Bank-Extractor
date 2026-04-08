@@ -380,8 +380,13 @@ def _clean_description(description: str) -> str:
     # 3. Strip trailing phone-number-like digit sequences
     description = _TRAILING_PHONE_RE.sub("", description).strip()
 
-    # Drop trailing standalone amount lines that come from summary/footer balances
+    # Drop standalone header lines like "Description" that can be merged into
+    # the first data row on a page break.
     lines = description.split("\n")
+    while lines and _is_header_only_line(lines[0]):
+        lines.pop(0)
+
+    # Drop trailing standalone amount lines that come from summary/footer balances
     while len(lines) > 1 and _is_standalone_amount_line(lines[-1]):
         lines.pop()
 
@@ -422,6 +427,27 @@ def _clean_description(description: str) -> str:
             run_len = 0
 
     return description
+
+
+def _is_header_only_line(line: str) -> bool:
+    """Return True when a line is just column-header text, not transaction text."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if any(ch.isdigit() for ch in stripped):
+        return False
+
+    words = [re.sub(r"[^A-Za-z0-9.]", "", word).lower() for word in stripped.split()]
+    words = [word for word in words if word]
+    if not words or len(words) > 4:
+        return False
+
+    header_words = {
+        "date", "description", "details", "detail", "debit", "credit", "balance",
+        "amount", "ref", "ref.", "reference", "number", "no", "no.", "value",
+        "chq", "chq.", "cheque",
+    }
+    return all(word in header_words for word in words)
 
 
 def _strip_page_header_prefix(description: str) -> str:
