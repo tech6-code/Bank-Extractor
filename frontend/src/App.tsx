@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useEffect, type DragEvent } from "react";
-import { ArrowLeftRight, Plus, Trash2 } from "lucide-react";
+import { ArrowLeftRight, CheckSquare, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -130,6 +130,7 @@ function App() {
   const [pdfPassword, setPdfPassword] = useState("");
   const [result, setResult] = useState<ExtractResult | null>(null);
   const [rows, setRows] = useState<EditableTransactionRow[]>([]);
+  const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
 
@@ -178,11 +179,15 @@ function App() {
   }, [renderedRows]);
 
   const swappedCount = useMemo(() => rows.filter((row) => row.isSwapped).length, [rows]);
+  const selectedCount = selectedRowIds.size;
+  const allVisibleRowsSelected = paginatedRows.length > 0 && paginatedRows.every((row) => selectedRowIds.has(row.id));
+  const someVisibleRowsSelected = paginatedRows.some((row) => selectedRowIds.has(row.id));
 
   const handleUpload = useCallback(async (file: File) => {
     setError(null);
     setResult(null);
     setRows([]);
+    setSelectedRowIds(new Set());
     setIsLoading(true);
     setPage(1);
 
@@ -249,6 +254,44 @@ function App() {
         : row
     )));
   }, []);
+
+  const toggleRowSelection = useCallback((rowId: string) => {
+    setSelectedRowIds((current) => {
+      const next = new Set(current);
+      if (next.has(rowId)) {
+        next.delete(rowId);
+      } else {
+        next.add(rowId);
+      }
+      return next;
+    });
+  }, []);
+
+  const toggleVisibleRowSelection = useCallback(() => {
+    setSelectedRowIds((current) => {
+      const next = new Set(current);
+      if (paginatedRows.every((row) => next.has(row.id))) {
+        paginatedRows.forEach((row) => next.delete(row.id));
+      } else {
+        paginatedRows.forEach((row) => next.add(row.id));
+      }
+      return next;
+    });
+  }, [paginatedRows]);
+
+  const clearSelectedRows = useCallback(() => {
+    setSelectedRowIds(new Set());
+  }, []);
+
+  const swapSelectedRows = useCallback(() => {
+    if (selectedRowIds.size === 0) return;
+    setRows((current) => current.map((row) => (
+      selectedRowIds.has(row.id)
+        ? { ...row, isSwapped: !row.isSwapped }
+        : row
+    )));
+    setSelectedRowIds(new Set());
+  }, [selectedRowIds]);
 
   const insertManualRowBelow = useCallback((rowId: string) => {
     setRows((current) => {
@@ -457,8 +500,45 @@ function App() {
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
               <p className="text-sm font-medium text-white/70">Review Controls</p>
               <p className="text-xs text-white/35">
-                Use the add icon to insert a manual row below any transaction. Swap still affects only that row and export follows the table exactly as shown.
+                Select multiple rows to bulk swap them, or use the add icon to insert a manual row below any transaction. Export follows the table exactly as shown.
               </p>
+            </div>
+
+            <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-sm font-medium text-white/70">Bulk Swap</p>
+                  <p className="text-xs text-white/35">
+                    {selectedCount > 0
+                      ? `${selectedCount} transaction row${selectedCount > 1 ? "s" : ""} selected`
+                      : "Select transaction rows from the table to swap debit and credit in one action."}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={clearSelectedRows}
+                    disabled={selectedCount === 0}
+                    className="text-white/50 hover:text-white/80 hover:bg-white/[0.04]"
+                  >
+                    Clear Selection
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={swapSelectedRows}
+                    disabled={selectedCount === 0}
+                    className="bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-400/20"
+                  >
+                    <span className="flex items-center gap-2">
+                      <CheckSquare className="h-4 w-4" />
+                      Swap Selected
+                    </span>
+                  </Button>
+                </div>
+              </div>
             </div>
 
             {swappedCount > 0 && result.validation && result.validation.validated_rows > 0 && (
@@ -575,6 +655,18 @@ function App() {
                 <Table>
                   <TableHeader>
                     <TableRow className="border-white/[0.06] hover:bg-transparent">
+                      <TableHead className="w-12 text-center">
+                        <input
+                          type="checkbox"
+                          checked={allVisibleRowsSelected}
+                          ref={(input) => {
+                            if (input) input.indeterminate = !allVisibleRowsSelected && someVisibleRowsSelected;
+                          }}
+                          onChange={toggleVisibleRowSelection}
+                          className="h-4 w-4 rounded border-white/20 bg-transparent accent-indigo-500"
+                          title="Select all rows on this page"
+                        />
+                      </TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider pl-5">Date</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider">Description</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Debit</TableHead>
@@ -615,6 +707,15 @@ function App() {
                                 : undefined
                           }
                         >
+                          <TableCell className="text-center align-top pt-4">
+                            <input
+                              type="checkbox"
+                              checked={selectedRowIds.has(row.id)}
+                              onChange={() => toggleRowSelection(row.id)}
+                              className="h-4 w-4 rounded border-white/20 bg-transparent accent-indigo-500"
+                              title="Select this row"
+                            />
+                          </TableCell>
                           <TableCell className="whitespace-nowrap text-white/50 text-sm font-mono pl-5">
                             {!isManualRow && isMismatch && (
                               <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 mr-2 shrink-0" />
