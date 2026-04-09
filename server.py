@@ -12,7 +12,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, HTTPException, Form
+from fastapi import FastAPI, UploadFile, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -108,6 +108,22 @@ def _get_working_pdf_path(file_id: str) -> Path:
     if unlocked_path.exists():
         return unlocked_path
     return TEMP_DIR / f"{file_id}.pdf"
+
+
+def _normalize_export_rows(rows: list[dict]) -> list[dict]:
+    """Keep only the exportable transaction fields as strings."""
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized.append({
+            "date": str(row.get("date", "") or ""),
+            "description": str(row.get("description", "") or ""),
+            "debit": str(row.get("debit", "") or ""),
+            "credit": str(row.get("credit", "") or ""),
+            "balance": str(row.get("balance", "") or ""),
+        })
+    return normalized
 
 
 def _prepare_working_pdf(pdf_path: Path, password: str | None, file_id: str) -> Path:
@@ -295,34 +311,42 @@ async def debug_pdf(file: UploadFile, password: str | None = Form(default=None))
 
 
 @app.post("/api/download/{file_id}")
-async def download_excel(file_id: str, swap_row_indices: str = ""):
+async def download_excel(
+    file_id: str,
+    payload: dict | None = Body(default=None),
+    swap_row_indices: str = "",
+):
     """Convert a previously uploaded PDF to Excel and return the file."""
     xlsx_path = TEMP_DIR / f"{file_id}.xlsx"
 
     try:
-        transactions = _cache.get(file_id)
-        if transactions is None:
+        export_rows = payload.get("rows") if isinstance(payload, dict) else None
+        if isinstance(export_rows, list):
+            export_transactions = _normalize_export_rows(export_rows)
+        else:
+            transactions = _cache.get(file_id)
+            if transactions is None:
             # Cache miss (e.g. server restarted) — re-extract from the saved PDF
-            pdf_path = _get_working_pdf_path(file_id)
-            if not pdf_path.exists():
-                raise HTTPException(404, "File not found. Please re-upload.")
-            raw = extract_transactions(str(pdf_path))
-            transactions, _ = _separate_meta(raw)
-            _cache_put(file_id, transactions)
+                pdf_path = _get_working_pdf_path(file_id)
+                if not pdf_path.exists():
+                    raise HTTPException(404, "File not found. Please re-upload.")
+                raw = extract_transactions(str(pdf_path))
+                transactions, _ = _separate_meta(raw)
+                _cache_put(file_id, transactions)
 
-        swap_indices = {
-            int(raw_idx)
-            for raw_idx in swap_row_indices.split(",")
-            if raw_idx.strip().isdigit()
-        }
-        export_transactions = [
-            {
-                **txn,
-                "debit": txn["credit"],
-                "credit": txn["debit"],
-            } if idx in swap_indices else txn
-            for idx, txn in enumerate(transactions)
-        ]
+            swap_indices = {
+                int(raw_idx)
+                for raw_idx in swap_row_indices.split(",")
+                if raw_idx.strip().isdigit()
+            }
+            export_transactions = [
+                {
+                    **txn,
+                    "debit": txn["credit"],
+                    "credit": txn["debit"],
+                } if idx in swap_indices else txn
+                for idx, txn in enumerate(transactions)
+            ]
 
         # Build a single table: header row + data rows
         table = [COLUMNS] + [

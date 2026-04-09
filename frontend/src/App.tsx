@@ -1,5 +1,5 @@
-import { useState, useCallback, useMemo, type DragEvent } from "react";
-import { ArrowLeftRight } from "lucide-react";
+import { useState, useCallback, useMemo, useEffect, type DragEvent } from "react";
+import { ArrowLeftRight, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -20,6 +20,13 @@ interface Transaction {
   debit: string;
   credit: string;
   balance: string;
+}
+
+interface EditableTransactionRow extends Transaction {
+  id: string;
+  source: "extracted" | "manual";
+  originalIndex: number | null;
+  isSwapped: boolean;
 }
 
 interface TemplateInfo {
@@ -61,41 +68,92 @@ interface ExtractResult {
   validation?: ValidationResult;
 }
 
+function createRowId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `row-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function normalizeExtractedRow(txn: Transaction, index: number): EditableTransactionRow {
+  return {
+    id: createRowId(),
+    source: "extracted",
+    originalIndex: index,
+    isSwapped: false,
+    ...txn,
+  };
+}
+
+function createManualRow(): EditableTransactionRow {
+  return {
+    id: createRowId(),
+    source: "manual",
+    originalIndex: null,
+    isSwapped: false,
+    date: "",
+    description: "",
+    debit: "",
+    credit: "",
+    balance: "",
+  };
+}
+
+function getRenderedTransaction(row: EditableTransactionRow): Transaction {
+  if (!row.isSwapped) {
+    return {
+      date: row.date,
+      description: row.description,
+      debit: row.debit,
+      credit: row.credit,
+      balance: row.balance,
+    };
+  }
+
+  return {
+    date: row.date,
+    description: row.description,
+    debit: row.credit,
+    credit: row.debit,
+    balance: row.balance,
+  };
+}
+
+function parseAmount(value: string) {
+  return parseFloat(value.replace(/,/g, "")) || 0;
+}
+
 function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [swappedRowKeys, setSwappedRowKeys] = useState<Set<string>>(new Set());
   const [pdfPassword, setPdfPassword] = useState("");
   const [result, setResult] = useState<ExtractResult | null>(null);
+  const [rows, setRows] = useState<EditableTransactionRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
 
-  const rowKey = useCallback((txn: Transaction, index: number) => (
-    `${index}::${txn.date}::${txn.description}::${txn.debit}::${txn.credit}::${txn.balance}`
-  ), []);
+  const renderedRows = useMemo(() => rows.map(getRenderedTransaction), [rows]);
 
-  const displayTransactions = useMemo(() => {
-    if (!result) return [];
-    return result.transactions.map((txn, index) => {
-      if (!swappedRowKeys.has(rowKey(txn, index))) return txn;
-      return {
-        ...txn,
-        debit: txn.credit,
-        credit: txn.debit,
-      };
-    });
-  }, [result, rowKey, swappedRowKeys]);
-
-  const totalPages = displayTransactions.length > 0
-    ? Math.ceil(displayTransactions.length / ROWS_PER_PAGE)
+  const totalPages = rows.length > 0
+    ? Math.ceil(rows.length / ROWS_PER_PAGE)
     : 0;
 
   const paginatedRows = useMemo(() => {
-    if (!displayTransactions.length) return [];
+    if (!rows.length) return [];
     const start = (page - 1) * ROWS_PER_PAGE;
-    return displayTransactions.slice(start, start + ROWS_PER_PAGE);
-  }, [displayTransactions, page]);
+    return rows.slice(start, start + ROWS_PER_PAGE);
+  }, [rows, page]);
+
+  useEffect(() => {
+    if (totalPages === 0 && page !== 1) {
+      setPage(1);
+      return;
+    }
+    if (totalPages > 0 && page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
 
   // Set of row indices that failed balance validation (for highlighting)
   const mismatchRows = useMemo(() => {
@@ -104,24 +162,27 @@ function App() {
   }, [result]);
 
   const stats = useMemo(() => {
-    if (!displayTransactions.length) return null;
+    if (!renderedRows.length) return null;
     let totalDebit = 0;
     let totalCredit = 0;
-    for (const t of displayTransactions) {
-      if (t.debit) totalDebit += parseFloat(t.debit.replace(/,/g, "")) || 0;
-      if (t.credit) totalCredit += parseFloat(t.credit.replace(/,/g, "")) || 0;
+    for (const t of renderedRows) {
+      if (t.debit) totalDebit += parseAmount(t.debit);
+      if (t.credit) totalCredit += parseAmount(t.credit);
     }
     return {
       totalDebit,
       totalCredit,
-      debitCount: displayTransactions.filter((t) => t.debit).length,
-      creditCount: displayTransactions.filter((t) => t.credit).length,
+      debitCount: renderedRows.filter((t) => t.debit).length,
+      creditCount: renderedRows.filter((t) => t.credit).length,
     };
-  }, [displayTransactions]);
+  }, [renderedRows]);
+
+  const swappedCount = useMemo(() => rows.filter((row) => row.isSwapped).length, [rows]);
 
   const handleUpload = useCallback(async (file: File) => {
     setError(null);
     setResult(null);
+    setRows([]);
     setIsLoading(true);
     setPage(1);
 
@@ -141,7 +202,7 @@ function App() {
       }
 
       const data: ExtractResult = await res.json();
-      setSwappedRowKeys(new Set());
+      setRows(data.transactions.map(normalizeExtractedRow));
       setResult(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -156,14 +217,14 @@ function App() {
     setIsDownloading(true);
 
     try {
-      const params = new URLSearchParams();
-      const swappedRows = result.transactions
-        .map((txn, index) => swappedRowKeys.has(rowKey(txn, index)) ? String(index) : null)
-        .filter((value): value is string => value !== null);
-      if (swappedRows.length > 0) params.set("swap_row_indices", swappedRows.join(","));
-      const downloadUrl = `${API_BASE}/api/download/${result.file_id}${params.size ? `?${params.toString()}` : ""}`;
-      const res = await fetch(downloadUrl, {
+      const res = await fetch(`${API_BASE}/api/download/${result.file_id}`, {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          rows: renderedRows,
+        }),
       });
       if (!res.ok) throw new Error("Download failed");
 
@@ -179,20 +240,41 @@ function App() {
     } finally {
       setIsDownloading(false);
     }
-  }, [result, rowKey, swappedRowKeys]);
+  }, [renderedRows, result]);
 
-  const toggleRowSwap = useCallback((txn: Transaction, globalIdx: number) => {
-    const key = rowKey(txn, globalIdx);
-    setSwappedRowKeys((current) => {
-      const next = new Set(current);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
+  const toggleRowSwap = useCallback((rowId: string) => {
+    setRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, isSwapped: !row.isSwapped }
+        : row
+    )));
+  }, []);
+
+  const insertManualRowBelow = useCallback((rowId: string) => {
+    setRows((current) => {
+      const index = current.findIndex((row) => row.id === rowId);
+      if (index === -1) return current;
+      const next = [...current];
+      next.splice(index + 1, 0, createManualRow());
       return next;
     });
-  }, [rowKey]);
+  }, []);
+
+  const updateManualRow = useCallback((
+    rowId: string,
+    field: keyof Transaction,
+    value: string,
+  ) => {
+    setRows((current) => current.map((row) => (
+      row.id === rowId
+        ? { ...row, [field]: value }
+        : row
+    )));
+  }, []);
+
+  const removeManualRow = useCallback((rowId: string) => {
+    setRows((current) => current.filter((row) => row.id !== rowId));
+  }, []);
 
   const onDragOver = (e: DragEvent) => {
     e.preventDefault();
@@ -375,11 +457,11 @@ function App() {
             <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
               <p className="text-sm font-medium text-white/70">Review Controls</p>
               <p className="text-xs text-white/35">
-                Use the swap icon on each transaction row to flip only that row&apos;s debit and credit values for review or export.
+                Use the add icon to insert a manual row below any transaction. Swap still affects only that row and export follows the table exactly as shown.
               </p>
             </div>
 
-            {swappedRowKeys.size > 0 && result.validation && result.validation.validated_rows > 0 && (
+            {swappedCount > 0 && result.validation && result.validation.validated_rows > 0 && (
               <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
                 <p className="text-sm font-medium text-amber-200">Some transaction rows currently have debit and credit swapped for review.</p>
                 <p className="mt-1 text-xs text-amber-200/70">
@@ -392,7 +474,7 @@ function App() {
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <StatCard
                 label="Transactions"
-                value={result.total_rows.toLocaleString()}
+                value={rows.length.toLocaleString()}
                 icon={
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 0 1 0 3.75H5.625a1.875 1.875 0 0 1 0-3.75Z" />
@@ -498,6 +580,7 @@ function App() {
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Debit</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Credit</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right">Balance</TableHead>
+                      <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-center">Add</TableHead>
                       <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-center">Swap</TableHead>
                       {result.validation?.row_variances && (
                         <TableHead className="text-white/40 font-semibold text-xs uppercase tracking-wider text-right pr-5">Variance</TableHead>
@@ -505,76 +588,160 @@ function App() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {paginatedRows.map((txn, i) => {
-                      const globalIdx = (page - 1) * ROWS_PER_PAGE + i;
-                      const isMismatch = mismatchRows.has(globalIdx);
-                      const isRowSwapped = result ? swappedRowKeys.has(rowKey(result.transactions[globalIdx], globalIdx)) : false;
+                    {paginatedRows.map((row) => {
+                      const renderedTxn = getRenderedTransaction(row);
+                      const isManualRow = row.source === "manual";
+                      const isMismatch = row.originalIndex !== null && mismatchRows.has(row.originalIndex);
+                      const variance = row.originalIndex !== null
+                        ? result.validation?.row_variances?.[row.originalIndex]
+                        : undefined;
+                      const hasVariance = variance !== undefined;
+                      const isZero = hasVariance && variance === 0;
                       return (
                         <TableRow
-                          key={`${txn.date}-${txn.balance}-${i}`}
+                          key={row.id}
                           className={`border-white/[0.03] hover:bg-white/[0.02] transition-colors ${
-                            isMismatch ? "border-l-2 border-l-amber-500/60 bg-amber-500/[0.03]" : ""
+                            isManualRow
+                              ? "bg-indigo-500/[0.04]"
+                              : isMismatch
+                                ? "border-l-2 border-l-amber-500/60 bg-amber-500/[0.03]"
+                                : ""
                           }`}
-                          title={isMismatch ? "Balance mismatch detected" : undefined}
+                          title={
+                            isManualRow
+                              ? "Manual transaction row"
+                              : isMismatch
+                                ? "Balance mismatch detected"
+                                : undefined
+                          }
                         >
                           <TableCell className="whitespace-nowrap text-white/50 text-sm font-mono pl-5">
-                            {isMismatch && (
+                            {!isManualRow && isMismatch && (
                               <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 mr-2 shrink-0" />
                             )}
-                            {txn.date}
+                            {isManualRow ? (
+                              <input
+                                type="text"
+                                value={row.date}
+                                onChange={(e) => updateManualRow(row.id, "date", e.target.value)}
+                                placeholder="DD/MM/YYYY"
+                                className="w-full min-w-[120px] rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+                              />
+                            ) : (
+                              renderedTxn.date
+                            )}
                           </TableCell>
                           <TableCell className="max-w-xl text-sm text-white/70 align-top">
-                            <span className="block whitespace-pre-wrap break-words leading-6">
-                              {txn.description}
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right whitespace-nowrap text-sm font-mono">
-                            {txn.debit && (
-                              <span className="text-red-400">{txn.debit}</span>
+                            {isManualRow ? (
+                              <input
+                                type="text"
+                                value={row.description}
+                                onChange={(e) => updateManualRow(row.id, "description", e.target.value)}
+                                placeholder="Enter transaction description"
+                                className="w-full rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+                              />
+                            ) : (
+                              <span className="block whitespace-pre-wrap break-words leading-6">
+                                {renderedTxn.description}
+                              </span>
                             )}
                           </TableCell>
                           <TableCell className="text-right whitespace-nowrap text-sm font-mono">
-                            {txn.credit && (
-                              <span className="text-emerald-400">{txn.credit}</span>
+                            {isManualRow ? (
+                              <input
+                                type="text"
+                                value={row.isSwapped ? row.credit : row.debit}
+                                onChange={(e) => updateManualRow(row.id, row.isSwapped ? "credit" : "debit", e.target.value)}
+                                placeholder="0.00"
+                                className="w-full min-w-[120px] rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-right text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+                              />
+                            ) : (
+                              renderedTxn.debit && (
+                                <span className="text-red-400">{renderedTxn.debit}</span>
+                              )
                             )}
                           </TableCell>
-                          <TableCell className={`text-right whitespace-nowrap text-sm font-mono ${
-                            !result.validation?.row_variances ? "" : ""
-                          } ${isMismatch ? "text-amber-400" : "text-white/60"}`}>
-                            {txn.balance}
+                          <TableCell className="text-right whitespace-nowrap text-sm font-mono">
+                            {isManualRow ? (
+                              <input
+                                type="text"
+                                value={row.isSwapped ? row.debit : row.credit}
+                                onChange={(e) => updateManualRow(row.id, row.isSwapped ? "debit" : "credit", e.target.value)}
+                                placeholder="0.00"
+                                className="w-full min-w-[120px] rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-right text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+                              />
+                            ) : (
+                              renderedTxn.credit && (
+                                <span className="text-emerald-400">{renderedTxn.credit}</span>
+                              )
+                            )}
+                          </TableCell>
+                          <TableCell className={`text-right whitespace-nowrap text-sm font-mono ${isMismatch ? "text-amber-400" : "text-white/60"}`}>
+                            {isManualRow ? (
+                              <input
+                                type="text"
+                                value={row.balance}
+                                onChange={(e) => updateManualRow(row.id, "balance", e.target.value)}
+                                placeholder="0.00"
+                                className="w-full min-w-[120px] rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-right text-sm text-white outline-none transition focus:border-indigo-400/60 focus:bg-white/[0.05]"
+                              />
+                            ) : (
+                              renderedTxn.balance
+                            )}
+                          </TableCell>
+                          <TableCell className="text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => insertManualRowBelow(row.id)}
+                                className="h-8 w-8 p-0 text-white/40 hover:text-white/80 hover:bg-white/[0.04]"
+                                title="Add a manual transaction row below"
+                              >
+                                <Plus className="h-4 w-4" />
+                              </Button>
+                              {isManualRow && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => removeManualRow(row.id)}
+                                  className="h-8 w-8 p-0 text-red-300/70 hover:text-red-200 hover:bg-red-500/[0.08]"
+                                  title="Remove this manual transaction row"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              )}
+                            </div>
                           </TableCell>
                           <TableCell className="text-center">
                             <Button
                               type="button"
                               variant="ghost"
                               size="sm"
-                              onClick={() => result && toggleRowSwap(result.transactions[globalIdx], globalIdx)}
+                              onClick={() => toggleRowSwap(row.id)}
                               className={`h-8 w-8 p-0 ${
-                                isRowSwapped
+                                row.isSwapped
                                   ? "text-indigo-300 bg-indigo-500/15 hover:bg-indigo-500/20"
                                   : "text-white/40 hover:text-white/70 hover:bg-white/[0.04]"
                               }`}
-                              title={isRowSwapped ? "Show original values" : "Swap debit and credit for this row"}
+                              title={row.isSwapped ? "Show original values" : "Swap debit and credit for this row"}
                             >
                               <ArrowLeftRight className="h-4 w-4" />
                             </Button>
                           </TableCell>
-                          {result.validation?.row_variances && (() => {
-                            const variance = result.validation.row_variances?.[globalIdx];
-                            const hasVariance = variance !== undefined;
-                            const isZero = hasVariance && variance === 0;
-                            return (
-                              <TableCell className={`text-right whitespace-nowrap text-sm font-mono pr-5 ${
-                                !hasVariance ? "text-white/20" :
-                                isZero ? "text-emerald-400/70" :
-                                "text-red-400"
-                              }`}>
-                                {!hasVariance ? "-" :
-                                 isZero ? "0" :
-                                 (variance > 0 ? "+" : "") + variance.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}
-                              </TableCell>
-                            );
-                          })()}
+                          {result.validation?.row_variances && (
+                            <TableCell className={`text-right whitespace-nowrap text-sm font-mono pr-5 ${
+                              !hasVariance ? "text-white/20" :
+                              isZero ? "text-emerald-400/70" :
+                              "text-red-400"
+                            }`}>
+                              {!hasVariance ? "-" :
+                               isZero ? "0" :
+                               (variance > 0 ? "+" : "") + variance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </TableCell>
+                          )}
                         </TableRow>
                       );
                     })}
@@ -588,8 +755,8 @@ function App() {
                   <p className="text-xs text-white/30">
                     {(page - 1) * ROWS_PER_PAGE + 1}
                     {" - "}
-                    {Math.min(page * ROWS_PER_PAGE, result.total_rows)} of{" "}
-                    {result.total_rows.toLocaleString()}
+                    {Math.min(page * ROWS_PER_PAGE, rows.length)} of{" "}
+                    {rows.length.toLocaleString()}
                   </p>
                   <div className="flex items-center gap-1">
                     <Button
