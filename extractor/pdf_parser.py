@@ -70,6 +70,8 @@ DATE_KEYWORDS = {
     "book date", "booking date", "clearing date",
     # Short abbreviations used by specific banks
     "vd", "pd", "txdt", "trdt",
+    # Chinese / bilingual layouts
+    "日期", "过账日期", "交易日期", "记账日期", "起息日",
 }
 
 DESC_KEYWORDS = {
@@ -92,6 +94,8 @@ DESC_KEYWORDS = {
     "chalan description", "instrument description",
     # Transaction column used by some banks (Mashreq Standard) as the description column
     "transaction", "transactions",
+    # Chinese / bilingual layouts
+    "摘要", "附言", "交易附言", "交易说明",
 }
 
 DEBIT_KEYWORDS = {
@@ -106,6 +110,8 @@ DEBIT_KEYWORDS = {
     "charge", "charges",
     "spent", "deductions",
     "disbursement", "disbursements",
+    # Chinese / bilingual layouts
+    "汇出金额", "支出金额", "借方", "付款金额",
 }
 
 CREDIT_KEYWORDS = {
@@ -118,6 +124,8 @@ CREDIT_KEYWORDS = {
     "receipt", "receipts",
     "received", "income",
     "collection", "collections",
+    # Chinese / bilingual layouts
+    "汇入金额", "收入金额", "贷方", "收款金额",
 }
 
 BALANCE_KEYWORDS = {
@@ -130,6 +138,8 @@ BALANCE_KEYWORDS = {
     "end balance", "ending balance",
     "net balance", "total balance",
     "o/b", "c/b",
+    # Chinese / bilingual layouts
+    "余额", "结余", "当前余额",
 }
 
 AMOUNT_KEYWORDS = {
@@ -163,6 +173,8 @@ SKIP_COL_KEYWORDS = {
     "channel", "type", "trans type", "transaction type",
     "currency", "ccy", "cur",
     "mode",
+    # Chinese / bilingual layouts
+    "银行参考号", "客户参考号", "参考号", "时间", "trn 类型", "trn类型", "类型",
 }
 
 # Rows containing these phrases (case-insensitive) are not real transactions.
@@ -717,8 +729,8 @@ def classify_column_header(header: str) -> tuple[str, float]:
     if not header:
         return "unknown", 0.0
 
-    # Normalise: strip non-ASCII (bilingual PDFs), collapse whitespace, lowercase
-    h = re.sub(r"[^\x00-\x7F]", "", header)
+    # Normalise: keep Unicode headers so bilingual layouts can be classified.
+    h = header
     h = re.sub(r"[*#()\[\]]", "", h)
     h = re.sub(r"\s+", " ", h).strip().lower()
     if not h:
@@ -2087,6 +2099,7 @@ def _extract_from_pymupdf(pdf_path: Path, forced_col_map: dict | None = None) ->
                     col_map_num_cols = num_cols
 
                 page_txn_count = 0
+                desc_idx = col_map.get("description")
                 for ri, row in enumerate(cleaned):
                     txn = _row_to_transaction(row, col_map)
                     if txn:
@@ -2100,11 +2113,53 @@ def _extract_from_pymupdf(pdf_path: Path, forced_col_map: dict | None = None) ->
                                 f"debit={txn['debit']}, credit={txn['credit']}, "
                                 f"balance={txn['balance']}"
                             )
-                    elif ri < 3:
-                        logger.info(
-                            f"PyMuPDF page {page_num}, table {ti}, row {ri}: "
-                            f"REJECTED: {[c[:40] for c in row]}"
-                        )
+                    else:
+                        # Continuation rows in PyMuPDF tables behave the same way as
+                        # pdfplumber: no date, no financial values, but text that
+                        # belongs to the previous transaction's description.
+                        _MAX_CONTINUATION_LINES = 8
+                        if transactions:
+                            date_idx = col_map.get("date", 0)
+                            date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
+                            cur_desc_lines = transactions[-1]["description"].count("\n") + 1 if transactions[-1]["description"] else 0
+                            if not date_cell and cur_desc_lines < _MAX_CONTINUATION_LINES:
+                                amount_cols = {
+                                    col_map.get(k)
+                                    for k in ("debit", "credit", "balance", "amount")
+                                    if isinstance(col_map.get(k), int)
+                                }
+                                amount_cols.add(date_idx)
+                                parts = []
+                                for ci, cell in enumerate(row):
+                                    if ci in amount_cols:
+                                        continue
+                                    txt = cell.strip()
+                                    if (
+                                        txt
+                                        and len(txt) > 1
+                                        and not _is_noise_line(txt)
+                                        and not _is_standalone_amount_line(txt)
+                                    ):
+                                        stripped_txt = txt.lstrip("/")
+                                        if _IBAN_RE.match(stripped_txt):
+                                            parts = []
+                                            break
+                                        parts.append(txt)
+                                if parts:
+                                    continuation_text = "\n".join(
+                                        _normalize_multiline_text(p) for p in parts if p
+                                    )
+                                    transactions[-1]["description"] = _clean_description(
+                                        _append_description(
+                                            transactions[-1]["description"],
+                                            continuation_text,
+                                        )
+                                    )
+                        if ri < 3:
+                            logger.info(
+                                f"PyMuPDF page {page_num}, table {ti}, row {ri}: "
+                                f"REJECTED: {[c[:40] for c in row]}"
+                            )
 
                 logger.info(
                     f"PyMuPDF page {page_num}, table {ti}: "
@@ -2122,8 +2177,8 @@ def _detect_columns(table: list[list[str]], page=None) -> dict | None:
     # First try header-based detection from table data
     for header_idx in range(min(3, len(table))):
         row = table[header_idx]
-        # Strip newlines and non-ASCII (bilingual headers like "Date\nتاريخ")
-        raw_headers = [re.sub(r"[^\x00-\x7F]", "", cell).replace("\n", " ").strip() for cell in row]
+        # Keep Unicode headers so bilingual layouts can be classified.
+        raw_headers = [str(cell or "").replace("\n", " ").strip() for cell in row]
 
         col_map: dict = {}
         assigned: set[str] = set()

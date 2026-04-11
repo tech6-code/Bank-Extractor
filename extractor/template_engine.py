@@ -11,6 +11,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from extractor.pdf_parser import classify_column_header
+
 logger = logging.getLogger(__name__)
 
 # Try to import DB functions — template features are disabled if MySQL is unavailable
@@ -44,15 +46,43 @@ def generate_fingerprint(
     Two PDFs from the same bank will produce the same fingerprint because
     banks use identical column headers and page dimensions.
     """
-    # Normalize: lowercase, strip whitespace, remove non-ASCII, sort
+    # Normalize: lowercase and strip whitespace, but keep Unicode headers so
+    # bilingual layouts do not collapse into data-like fingerprints.
     normalized = sorted(
-        re.sub(r"[^\x00-\x7F]", "", h).strip().lower()
+        re.sub(r"\s+", " ", h).strip().lower()
         for h in header_texts
         if h and h.strip()
     )
 
     raw = f"{column_count}|{int(page_width)}|{'|'.join(normalized)}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _header_row_score(row: list) -> tuple[int, list[str]]:
+    cleaned = [
+        re.sub(r"\s+", " ", str(cell or "")).replace("\n", " ").strip()
+        for cell in row
+    ]
+    meaningful = 0
+    normalized_headers: list[str] = []
+    for cell in cleaned:
+        if not cell:
+            normalized_headers.append("")
+            continue
+        role, confidence = classify_column_header(cell)
+        if role not in ("unknown", "skip") and confidence >= 0.85:
+            meaningful += 1
+        normalized_headers.append(cell)
+    return meaningful, normalized_headers
+
+
+def _is_layout_header_candidate(header_texts: list[str]) -> bool:
+    recognized_roles = 0
+    for header in header_texts:
+        role, confidence = classify_column_header(header)
+        if role not in ("unknown", "skip") and confidence >= 0.85:
+            recognized_roles += 1
+    return recognized_roles >= 2
 
 
 def extract_layout_info(pdf_path: str | Path) -> Optional[dict]:
@@ -118,22 +148,19 @@ def _extract_layout_pymupdf(pdf_path: str | Path) -> Optional[dict]:
 
         column_count = len(table_data[0])
 
-        # Extract headers from first few rows
+        # Prefer an actual header row, not the first non-empty data row.
         header_texts = []
         header_row_idx = 0
-        for idx in range(min(3, len(table_data))):
+        best_score = -1
+        for idx in range(min(6, len(table_data))):
             row = table_data[idx]
-            cleaned = [
-                re.sub(r"[^\x00-\x7F]", "", str(cell or "")).replace("\n", " ").strip()
-                for cell in row
-            ]
-            non_empty = sum(1 for c in cleaned if c)
-            if non_empty >= 2:
+            score, cleaned = _header_row_score(row)
+            if score > best_score:
+                best_score = score
                 header_texts = cleaned
                 header_row_idx = idx
-                break
 
-        if not header_texts:
+        if not header_texts or not _is_layout_header_candidate(header_texts):
             doc.close()
             return None
 
@@ -195,20 +222,16 @@ def _extract_layout_pdfplumber(pdf_path: str | Path) -> Optional[dict]:
 
             column_count = len(table[0])
 
-            # Extract headers
+            # Prefer an actual header row, not the first non-empty data row.
             header_texts = []
-            for idx in range(min(3, len(table))):
-                row = table[idx]
-                cleaned = [
-                    re.sub(r"[^\x00-\x7F]", "", str(cell or "")).replace("\n", " ").strip()
-                    for cell in row
-                ]
-                non_empty = sum(1 for c in cleaned if c)
-                if non_empty >= 2:
+            best_score = -1
+            for idx in range(min(6, len(table))):
+                score, cleaned = _header_row_score(table[idx])
+                if score > best_score:
+                    best_score = score
                     header_texts = cleaned
-                    break
 
-            if not header_texts:
+            if not header_texts or not _is_layout_header_candidate(header_texts):
                 return None
 
             # Get x-positions from words on the page
@@ -531,6 +554,9 @@ def save_extraction_template(
     layout = extract_layout_info(pdf_path)
     if not layout:
         logger.debug("Could not extract layout info for template saving")
+        return None
+    if not _is_layout_header_candidate(layout.get("header_texts", [])):
+        logger.warning("Skipping template save: detected header row is not trustworthy (%s)", layout.get("header_texts"))
         return None
 
     fingerprint = generate_fingerprint(
