@@ -11,6 +11,9 @@ build/
 venv/
 env/
 
+# Temp files
+.tmp/
+
 # Uploads (user PDFs - sensitive data)
 uploads/
 

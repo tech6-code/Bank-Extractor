@@ -1,3 +1,4 @@
+from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from pathlib import Path
@@ -69,3 +70,19 @@ def write_tables_to_excel(
 
     wb.save(output_path)
     return str(output_path.resolve())
+
+
+def write_tables_to_excel_bytes(
+    tables: list[list[list[str]]],
+    sheet_name: str = "Bank Statement",
+) -> bytes:
+    """Write extracted tables to an in-memory Excel file."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    write_tables_to_sheet(ws, tables)
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()

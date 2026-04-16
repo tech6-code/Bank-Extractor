@@ -1,5 +1,6 @@
 """FastAPI backend for the Bank Statement Converter."""
 
+from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -14,13 +15,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
 import fitz
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
-from extractor.excel_writer import write_tables_to_excel
+from extractor.excel_writer import write_tables_to_excel_bytes
 from extractor.template_engine import match_template, save_extraction_template, detect_bank_name
 from extractor.balance_validator import validate_balances
 
@@ -30,8 +31,20 @@ logging.getLogger("extractor.pdf_parser").setLevel(getattr(logging, LOG_LEVEL, l
 logging.getLogger("pdfminer").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-TEMP_DIR = Path(tempfile.gettempdir()) / "bank-statement-extractor"
-TEMP_DIR.mkdir(exist_ok=True)
+APP_BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_TMP_ROOT = Path(os.getenv("BANK_EXTRACTOR_TMP_DIR", APP_BASE_DIR / ".tmp"))
+UPLOAD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Force Python/Starlette multipart temp files onto the workspace drive instead of
+# the system temp directory. This avoids 400 "error parsing the body" failures
+# when C:\ is full, because request-body spooling happens before route handlers run.
+tempfile.tempdir = str(UPLOAD_TMP_ROOT)
+os.environ["TMPDIR"] = str(UPLOAD_TMP_ROOT)
+os.environ["TEMP"] = str(UPLOAD_TMP_ROOT)
+os.environ["TMP"] = str(UPLOAD_TMP_ROOT)
+
+TEMP_DIR = UPLOAD_TMP_ROOT / "bank-statement-extractor"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 FILE_TTL_SECONDS = 3600  # 1 hour
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "50"))
@@ -317,8 +330,6 @@ async def download_excel(
     swap_row_indices: str = "",
 ):
     """Convert a previously uploaded PDF to Excel and return the file."""
-    xlsx_path = TEMP_DIR / f"{file_id}.xlsx"
-
     try:
         export_rows = payload.get("rows") if isinstance(payload, dict) else None
         if isinstance(export_rows, list):
@@ -353,16 +364,16 @@ async def download_excel(
             [txn["date"], txn["description"], txn["debit"], txn["credit"], txn["balance"]]
             for txn in export_transactions
         ]
-        write_tables_to_excel([table], str(xlsx_path))
+        xlsx_bytes = write_tables_to_excel_bytes([table])
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(500, f"Failed to generate Excel: {e}")
 
-    return FileResponse(
-        path=str(xlsx_path),
+    return StreamingResponse(
+        BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="bank_statement.xlsx",
+        headers={"Content-Disposition": 'attachment; filename="bank_statement.xlsx"'},
         background=BackgroundTask(_cleanup_after_download, file_id),
     )
 

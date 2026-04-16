@@ -45,6 +45,19 @@ DATE_START_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Some PDFs split a 4-digit year across two text chunks, e.g. "01-01-20 25".
+# Normalize that back to "01-01-2025" before date parsing so the trailing "25"
+# does not bleed into the description.
+_SPLIT_NUMERIC_YEAR_PREFIX_RE = re.compile(
+    r"^(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2})\s+(\d{2})(?=\D|$)"
+)
+
+
+def _normalize_split_year_prefix(text: str) -> str:
+    if not text:
+        return text
+    return _SPLIT_NUMERIC_YEAR_PREFIX_RE.sub(r"\1\2", text, count=1)
+
 AMOUNT_RE = re.compile(r"-?[\d,]+\.\d{2}")
 SIGNED_AMOUNT_RE = re.compile(r"[+\-]?[\d,]+\.\d{2}")
 FLEX_AMOUNT_RE = re.compile(r"-?[\d,]+(?:\.\d{1,2})?$")
@@ -202,6 +215,9 @@ _SOFT_SKIP_PHRASES = [
     "no notice of disagreement", "paid up capital",
     "registered details: emirates",
     "account summary",
+    "your account summary",
+    "your adib account",
+    "kindly avoid sharing",
 ]
 
 # Regex to detect IBAN numbers in description text (clear sign of a header dump)
@@ -217,6 +233,7 @@ _DESC_HEADER_RES = [
     re.compile(r"^account summary\b", re.IGNORECASE),
     re.compile(r"^summary of account", re.IGNORECASE),
     re.compile(r"^transaction history\b", re.IGNORECASE),
+    re.compile(r"^your\s+\w+\s+account\s+statement\b", re.IGNORECASE),  # "Your ADIB Account Statement"
 ]
 
 # Matches a single page-header metadata field (keyword + value).
@@ -226,7 +243,7 @@ _DESC_HEADER_RES = [
 # Taking the end position of the LAST match gives the start of the real description.
 _PAGE_META_FIELD_RE = re.compile(
     r"(?:"
-    r"currency\s+[A-Z]{2,4}"                             # Currency AED
+    r"(?:currency|cur)\s+[A-Z]{2,4}"                     # Currency AED / CUR AED
     r"|page\s+(?:number\s+)?\d+"                          # Page 1 / Page number 1
     r"|account\s+(?:type|number|no\.?|holder)\s+\S+"      # Account type / Account number
     r"|iban\s+[A-Z]{2}[\dA-Z]{10,}"                      # IBAN AE86041...
@@ -274,6 +291,13 @@ _DESC_FOOTER_MARKERS = [
     "errors and omissions excepted",
     "banking / select card>>manage card >> block card",
     "main menu.",
+    # ADIB-specific security warning / header phrases
+    "kindly avoid sharing",
+    "adib staff will never",
+    "click here for more information",
+    "not applicable",
+    "quick approvals & finance",
+    "adib personal finance",
     "sharia, as defined in the aaoifi",
     "sharia standards and the guidance of dib issc",
     "realization of profit from the underlying investments",
@@ -961,11 +985,20 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
     # PyMuPDF uses visual ruling-line detection so it captures the first data row
     # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
     pymupdf_txns, pymupdf_col_map = _extract_from_pymupdf(pdf_path)
-    try:
-        pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
-    except Exception as e:
-        logger.warning(f"pdfplumber table extraction failed: {e}")
+    # If PyMuPDF found no transactions (no ruling lines / borderless PDF),
+    # skip pdfplumber entirely — its default strategy will also fail and
+    # its text-fallback is expensive but produces inferior results compared
+    # to the dedicated words/text strategies below.
+    if not pymupdf_txns:
+        logger.info("PyMuPDF found 0 transactions (borderless PDF?) — skipping pdfplumber, "
+                     "falling through to words/text strategies")
         pdfplumber_txns, pdfplumber_col_map = [], None
+    else:
+        try:
+            pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
+        except Exception as e:
+            logger.warning(f"pdfplumber table extraction failed: {e}")
+            pdfplumber_txns, pdfplumber_col_map = [], None
 
     pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
     pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
@@ -998,6 +1031,11 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
             source = "pdfplumber"
             detected_col_map = pdfplumber_col_map
 
+        peer_txns = pdfplumber_txns if source == "pymupdf" else pymupdf_txns
+        enriched = _enrich_transactions(transactions, peer_txns)
+        if enriched:
+            logger.info(f"Enriched {enriched} existing transactions with peer table-strategy data")
+
         logger.info(
             f"Strategy 1 ({source}): {len(transactions)} transactions "
             f"(pymupdf={len(pymupdf_txns)}, pdfplumber={len(pdfplumber_txns)})"
@@ -1029,20 +1067,28 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
         # ── Supplement: if text/words extraction finds significantly more
         # transactions, some pages likely had no tables.  Merge the extra
         # transactions (those not already present by date+amount+balance).
-        # Try both strategies and use whichever adds more quality transactions.
+        # Skip supplement when table strategy already has good coverage — running
+        # words/text strategies on large PDFs is expensive and rarely helps.
         supplement_candidates = []
-        for strat_name, strat_fn in [("words", _extract_from_words), ("text", _extract_from_text)]:
-            try:
-                strat_txns = strat_fn(pdf_path)
-                if strat_txns and len(strat_txns) > len(transactions) * 1.3:
-                    supplement_candidates.append((strat_name, strat_txns))
-            except Exception:
-                pass
+        if has_amounts_pct < 0.70:
+            for strat_name, strat_fn in [("words", _extract_from_words), ("text", _extract_from_text)]:
+                try:
+                    strat_txns = strat_fn(pdf_path)
+                    if strat_txns and len(strat_txns) > len(transactions) * 1.3:
+                        supplement_candidates.append((strat_name, strat_txns))
+                except Exception:
+                    pass
 
         if supplement_candidates:
             # Pick the supplement with the highest quality score
             supplement_candidates.sort(key=lambda x: _extraction_quality_score(x[1]), reverse=True)
             supp_name, supp_txns = supplement_candidates[0]
+
+            enriched = _enrich_transactions(transactions, supp_txns)
+            if enriched:
+                logger.info(
+                    f"Enriched {enriched} existing transactions with {supp_name}-strategy data"
+                )
 
             existing_keys = {
                 (t.get("date", ""), t.get("debit", ""), t.get("credit", ""), t.get("balance", ""))
@@ -1082,12 +1128,27 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
     except Exception as e:
         logger.warning(f"Word extraction failed: {e}")
 
-    # Strategy 3: text-based line parsing (always try; pick better of words vs text)
+    # Strategy 3: text-based line parsing — only needed when words strategy is weak.
+    # Skip the expensive text scan when words already has good quality (all rows
+    # have amounts and ≥95% have balance), since text strategy is much slower.
     text_txns: list[dict] = []
-    try:
-        text_txns = _extract_from_text(pdf_path)
-    except Exception as e:
-        logger.warning(f"Text extraction failed: {e}")
+    words_n = len(words_txns)
+    words_has_bal_pct = (
+        sum(1 for t in words_txns if t.get("balance")) / words_n if words_n else 0
+    )
+    words_has_amt_pct = (
+        sum(1 for t in words_txns if t.get("debit") or t.get("credit")) / words_n if words_n else 0
+    )
+    if words_has_bal_pct < 0.95 or words_has_amt_pct < 0.90 or words_n == 0:
+        try:
+            text_txns = _extract_from_text(pdf_path)
+        except Exception as e:
+            logger.warning(f"Text extraction failed: {e}")
+    else:
+        logger.info(
+            f"Skipping text strategy — words already high quality "
+            f"({words_n} txns, {words_has_bal_pct:.0%} balance, {words_has_amt_pct:.0%} amounts)"
+        )
 
     # Pick whichever fallback strategy gives better quality
     if words_txns or text_txns:
@@ -1123,17 +1184,44 @@ def _extract_with_template(
     This skips column detection entirely — the col_map is already known.
     Falls back to the full pipeline if the preferred strategy fails.
     """
+    txns: list[dict] = []
+    peer_candidates: list[list[dict]] = []
+
     if strategy == "pymupdf":
         txns, _ = _extract_from_pymupdf(pdf_path, forced_col_map=col_map)
-        return txns
+        try:
+            peer_txns, _ = _extract_from_tables(pdf_path)
+            peer_candidates.append(peer_txns)
+        except Exception:
+            pass
     elif strategy == "pdfplumber":
         txns, _ = _extract_from_tables(pdf_path, forced_col_map=col_map)
-        return txns
+        try:
+            peer_txns, _ = _extract_from_pymupdf(pdf_path)
+            peer_candidates.append(peer_txns)
+        except Exception:
+            pass
     elif strategy == "words":
-        return _extract_from_words(pdf_path)
+        txns = _extract_from_words(pdf_path)
     elif strategy == "text":
-        return _extract_from_text(pdf_path)
-    return []
+        txns = _extract_from_text(pdf_path)
+    else:
+        return []
+
+    # Enrich the template-guided result with peer strategies before the quality
+    # gate runs. This is especially useful when the forced template captures the
+    # right rows but intermittently misses the running-balance column.
+    for strat_fn in (_extract_from_words, _extract_from_text):
+        try:
+            peer_candidates.append(strat_fn(pdf_path))
+        except Exception:
+            pass
+
+    for peer_txns in peer_candidates:
+        if peer_txns:
+            _enrich_transactions(txns, peer_txns)
+
+    return txns
 
 
 def _has_merged_rows(transactions: list[dict]) -> bool:
@@ -1181,6 +1269,111 @@ def _extraction_quality_score(transactions: list[dict]) -> float:
         row_score = (0.7 if has_amount else 0.1) + (0.3 if has_balance else 0.0)
         score += row_score
     return score
+
+
+def _normalize_merge_date_key(date_str: str) -> str:
+    """Normalize dates for cross-strategy matching.
+
+    This intentionally ignores year precision when the same row appears as
+    `01-07-20` in one strategy and `01-07-2025` in another.
+    """
+    date_str = str(date_str or "").strip()
+    m = re.match(r"^(\d{1,2}[/\-.]\d{1,2})(?:[/\-.]\d{2,4})?$", date_str)
+    if m:
+        return m.group(1)
+    return date_str
+
+
+def _normalize_merge_description(desc: str) -> str:
+    """Normalize descriptions for cross-strategy matching."""
+    desc = re.sub(r"\s+", " ", str(desc or "")).strip().lower()
+    # Some layouts leak the second half of the year into the description:
+    # `25 Merchant Payment...` instead of `...2025` in the date column.
+    desc = re.sub(r"^\d{2}\s+", "", desc)
+    return desc
+
+
+def _txn_merge_key(txn: dict) -> tuple:
+    """Key for enriching the same transaction across strategies.
+
+    Uses the normalized date, a description prefix, and explicit debit/credit
+    amounts. Balance is excluded so a stronger variant can fill it in later.
+    """
+    desc = _normalize_merge_description(txn.get("description", ""))
+    return (
+        _normalize_merge_date_key(txn.get("date", "")),
+        desc[:60],
+        str(txn.get("debit", "") or "").strip(),
+        str(txn.get("credit", "") or "").strip(),
+    )
+
+
+def _enrich_transactions(base: list[dict], candidates: list[dict]) -> int:
+    """Fill missing fields in base rows from equivalent candidate rows.
+
+    The primary use-case is when the chosen strategy extracted the transaction
+    row but missed the running balance, while another strategy found it.
+    """
+    if not base or not candidates:
+        return 0
+
+    mergeable: dict[tuple, list[dict]] = defaultdict(list)
+    loose_mergeable: dict[tuple, list[dict]] = defaultdict(list)
+    for row in base:
+        strict_key = _txn_merge_key(row)
+        mergeable[strict_key].append(row)
+        loose_key = (
+            _normalize_merge_date_key(row.get("date", "")),
+            str(row.get("debit", "") or "").strip(),
+            str(row.get("credit", "") or "").strip(),
+        )
+        loose_mergeable[loose_key].append(row)
+
+    updates = 0
+    for cand in candidates:
+        matches = mergeable.get(_txn_merge_key(cand), [])
+        if len(matches) == 1:
+            row = matches[0]
+        else:
+            loose_key = (
+                _normalize_merge_date_key(cand.get("date", "")),
+                str(cand.get("debit", "") or "").strip(),
+                str(cand.get("credit", "") or "").strip(),
+            )
+            loose_matches = loose_mergeable.get(loose_key, [])
+            cand_desc = _normalize_merge_description(cand.get("description", ""))
+            narrowed = [
+                row for row in loose_matches
+                if (
+                    _normalize_merge_description(row.get("description", "")) in cand_desc
+                    or cand_desc in _normalize_merge_description(row.get("description", ""))
+                )
+            ]
+            if len(narrowed) != 1:
+                continue
+            row = narrowed[0]
+
+        changed = False
+        if not row.get("balance") and cand.get("balance"):
+            row["balance"] = cand["balance"]
+            changed = True
+        if (
+            len(str(cand.get("description", "") or "")) >
+            len(str(row.get("description", "") or ""))
+        ):
+            row["description"] = cand["description"]
+            changed = True
+        if (
+            len(str(cand.get("date", "") or "")) >
+            len(str(row.get("date", "") or ""))
+        ):
+            row["date"] = cand["date"]
+            changed = True
+
+        if changed:
+            updates += 1
+
+    return updates
 
 
 def _fill_page_gaps(
@@ -2427,7 +2620,7 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
             return None
 
     # Date check first so we can skip non-transaction rows quickly.
-    date = get("date")
+    date = _normalize_split_year_prefix(get("date"))
     date = re.sub(r"\s*([/\-.])\s*", r"\1", date)
     date = re.sub(r"\s+", " ", date).strip()
     # Trim to just the matched date — prevents ref-number bleed when pdfplumber
@@ -2437,6 +2630,21 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
         logger.debug(f"Row rejected (no valid date): date_cell={date!r}, row={[c[:30] for c in row]}")
         return None
     date = _date_match.group(1) if _date_match.lastindex else _date_match.group(0)
+
+    # Cross-cell year recovery: when the column boundary splits "2025" so that
+    # "01-01-20" is in the date cell and "25" bleeds into the description cell,
+    # detect this and move the trailing year digits back to the date.
+    _split_year_recovered = False
+    _two_digit_year_match = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2})$", date)
+    if _two_digit_year_match:
+        raw_desc = get("description")
+        _desc_year_match = re.match(r"^(\d{2})(?:\s+|$)", raw_desc)
+        if _desc_year_match:
+            candidate_year = date[-2:] + _desc_year_match.group(1)
+            if candidate_year.startswith("20") or candidate_year.startswith("19"):
+                sep = date[2] if len(date) > 2 and not date[2].isdigit() else "-"
+                date = f"{_two_digit_year_match.group(1)}{sep}{_two_digit_year_match.group(2)}{sep}{candidate_year}"
+                _split_year_recovered = True
 
     # Parse amount cells before skip-phrase checks. This prevents valid first-row
     # transactions (with page-header contamination) from being discarded.
@@ -2456,6 +2664,9 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     # Pre-clean description before row-level filters. The first transaction row on
     # each page often carries merged page-header metadata in this cell.
     description = _normalize_multiline_text(get("description"))
+    # If we recovered year digits from the description, strip them
+    if _split_year_recovered:
+        description = re.sub(r"^\d{2}\s*", "", description, count=1)
     desc_lower = description.lower()
     header_was_contaminated = (
         any(p.match(description) for p in _DESC_HEADER_RES)
@@ -2603,6 +2814,7 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                 lines_by_top[round(w['top'])].append(w)
 
             last_date_y = None  # y-position of the most recent date line
+            last_line_y = None  # y-position of the most recently processed line
             for top in sorted(lines_by_top.keys()):
                 line_words = sorted(lines_by_top[top], key=lambda w: w['x0'])
                 if not line_words:
@@ -2623,15 +2835,19 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                             pending_desc_lines = []
                         continue
                     # Decide: continuation of previous transaction or pending for next?
-                    # Use y-gap: if close to the last date line (<25px), it's continuation.
-                    # Otherwise, it's a pending description for the next transaction.
-                    # A wider gap (25px vs old 18px) catches multi-line descriptions
-                    # that span 2-3 lines within a single table row.
+                    # Use two y-gap checks:
+                    #   1. Distance from date line < 25px (overall transaction zone)
+                    #   2. Distance from previous line < 15px (inter-line continuity)
+                    # The inter-line check catches transaction boundaries where the
+                    # gap between rows (e.g. 18.5px in RAKBANK) is larger than the
+                    # gap within a row (e.g. 4-9px).
+                    inter_line_gap = (top - last_line_y) if last_line_y is not None else 0
                     is_continuation = (
                         transactions
                         and not pending_desc_lines
                         and last_date_y is not None
                         and (top - last_date_y) < 25
+                        and inter_line_gap < 15
                     )
                     if is_continuation:
                         if not _is_noise_line(line_text) and not _is_standalone_amount_line(line_text):
@@ -2639,7 +2855,7 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                             prev["description"] = _clean_description(
                                 _append_description(prev["description"], line_text)
                             )
-                        last_date_y = top  # Extend the "current transaction" zone
+                        last_line_y = top
                     else:
                         if not _is_standalone_amount_line(line_text):
                             pending_desc_lines.append(line_text)
@@ -2647,6 +2863,7 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
 
                 # Date line — extract column values by x-position
                 last_date_y = top
+                last_line_y = top
                 date = first_text
                 description_parts = []
                 debit = ""
@@ -2701,7 +2918,11 @@ def _extract_from_words(pdf_path: Path) -> list[dict]:
                     desc = _append_description(pre, desc) if desc else pre
                     pending_desc_lines = []
 
+                # Preserve zero balances (0.00 is valid) but clean amounts normally
+                raw_balance = balance.strip().replace(" ", "")
                 balance = _clean_amount(balance)
+                if not balance and raw_balance and re.fullmatch(r"0+(?:\.0+)?", raw_balance.replace(",", "")):
+                    balance = "0.00"
                 debit = _clean_amount(debit)
                 credit = _clean_amount(credit)
 
@@ -3032,6 +3253,8 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
     Uses prev_balance (if available) to determine debit vs credit:
     balance increased → credit, balance decreased → debit.
     """
+    line = _normalize_split_year_prefix(line.strip())
+
     # Try date at start of line first
     date_match = None
     rest_start = 0
@@ -3103,9 +3326,22 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
         first_raw = trailing_amounts[0].group(1)
         first_val = first_raw.replace(",", "").lstrip("+-")
         has_decimal = "." in first_val
+        has_comma = "," in first_raw
         is_negative = first_raw.startswith("-")
         is_explicit_plus = first_raw.startswith("+")
         is_large = float(first_val) >= 1000 if first_val.replace(".", "").isdigit() else False
+        is_plain_year = (
+            not has_decimal
+            and not has_comma
+            and not is_negative
+            and not is_explicit_plus
+            and first_val.isdigit()
+            and len(first_val) == 4
+            and 1900 <= int(first_val) <= 2099
+        )
+        if is_plain_year and len(trailing_amounts) >= 3:
+            trailing_amounts.pop(0)
+            continue
         if not has_decimal and not is_negative and not is_explicit_plus and not is_large:
             # Small plain integer — check balance chain before discarding
             if prev_balance is not None and len(trailing_amounts) == 2:
