@@ -22,7 +22,11 @@ import fitz
 import pdfplumber
 from extractor.pdf_parser import extract_transactions
 from extractor.excel_writer import write_tables_to_excel_bytes
-from extractor.template_engine import match_template, save_extraction_template, detect_bank_name
+from extractor.template_engine import (
+    match_template,
+    save_extraction_template_detailed,
+    detect_bank_name,
+)
 from extractor.balance_validator import validate_balances
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -230,22 +234,31 @@ async def extract_preview(file: UploadFile, password: str | None = Form(default=
             try:
                 col_map = meta.get("col_map", {})
                 strategy = meta.get("strategy", "unknown")
-                template_id = save_extraction_template(
+                save_result = save_extraction_template_detailed(
                     pdf_path=str(working_pdf_path),
                     col_map=col_map,
                     strategy=strategy,
                     transactions_count=len(transactions),
                 )
+                template_id = save_result.get("template_id")
                 if template_id:
                     template_info["template_id"] = template_id
                     template_info["template_saved"] = True
-                    # Detect bank name for the response
-                    bank_name = detect_bank_name(str(working_pdf_path))
+                    bank_name = save_result.get("bank_name") or detect_bank_name(str(working_pdf_path))
                     if bank_name:
                         template_info["template_bank_name"] = bank_name
                     logger.info(f"New template saved (id={template_id}, bank={bank_name or 'unknown'})")
+                else:
+                    template_info["template_saved"] = False
+                    reason = save_result.get("reason") or "unknown"
+                    template_info["template_save_reason"] = reason
+                    if save_result.get("headers"):
+                        template_info["template_save_headers"] = save_result["headers"]
+                    logger.info(f"Template not saved — reason: {reason}")
             except Exception as e:
                 logger.warning(f"Template saving failed (non-critical): {e}")
+                template_info["template_saved"] = False
+                template_info["template_save_reason"] = "exception"
 
     # ── Balance validation ───────────────────────────────────────────────
     validation = {}

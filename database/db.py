@@ -297,3 +297,23 @@ def update_template_bank_name(template_id: int, bank_name: str) -> bool:
     except Error as e:
         logger.warning("Failed to update bank name: %s", e)
         return False
+
+
+def update_template_fingerprint(template_id: int, new_fingerprint: str) -> bool:
+    """Update a template's fingerprint (used to migrate legacy fingerprints).
+
+    Silently returns False if another row already has the new fingerprint
+    (duplicate-key) — the caller should keep using the existing match.
+    """
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE templates SET fingerprint = %s WHERE id = %s",
+                (new_fingerprint, template_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Error as e:
+        logger.info("Fingerprint migration skipped for template %s: %s", template_id, e)
+        return False

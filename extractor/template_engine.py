@@ -24,11 +24,19 @@ try:
         save_template,
         save_column_aliases,
         increment_success_count,
+        update_template_fingerprint,
     )
     DB_AVAILABLE = True
 except Exception:
     DB_AVAILABLE = False
     logger.info("Database not available — template matching disabled")
+
+
+# Confidence/role thresholds: lower values admit more bilingual / unusual
+# bank headers. The match path is more permissive than the save path.
+_HEADER_ROLE_CONF_MIN = 0.70
+_MIN_ROLES_FOR_MATCH = 1
+_MIN_ROLES_FOR_SAVE = 2
 
 
 def generate_fingerprint(
@@ -58,6 +66,26 @@ def generate_fingerprint(
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def generate_legacy_fingerprint(
+    header_texts: list[str],
+    column_count: int,
+    page_width: float,
+) -> str:
+    """Reproduce the pre-2026-04-11 fingerprint algorithm.
+
+    Old algorithm stripped non-ASCII from each header before normalizing.
+    Templates saved before the Unicode-aware change still have fingerprints
+    computed this way; we compute both on lookup so legacy rows keep matching.
+    """
+    normalized = sorted(
+        re.sub(r"[^\x00-\x7F]", "", h).strip().lower()
+        for h in header_texts
+        if h and h.strip()
+    )
+    raw = f"{column_count}|{int(page_width)}|{'|'.join(normalized)}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def _header_row_score(row: list) -> tuple[int, list[str]]:
     cleaned = [
         re.sub(r"\s+", " ", str(cell or "")).replace("\n", " ").strip()
@@ -70,19 +98,23 @@ def _header_row_score(row: list) -> tuple[int, list[str]]:
             normalized_headers.append("")
             continue
         role, confidence = classify_column_header(cell)
-        if role not in ("unknown", "skip") and confidence >= 0.85:
+        if role not in ("unknown", "skip") and confidence >= _HEADER_ROLE_CONF_MIN:
             meaningful += 1
         normalized_headers.append(cell)
     return meaningful, normalized_headers
 
 
-def _is_layout_header_candidate(header_texts: list[str]) -> bool:
-    recognized_roles = 0
+def _count_recognized_roles(header_texts: list[str]) -> int:
+    recognized = 0
     for header in header_texts:
         role, confidence = classify_column_header(header)
-        if role not in ("unknown", "skip") and confidence >= 0.85:
-            recognized_roles += 1
-    return recognized_roles >= 2
+        if role not in ("unknown", "skip") and confidence >= _HEADER_ROLE_CONF_MIN:
+            recognized += 1
+    return recognized
+
+
+def _is_layout_header_candidate(header_texts: list[str], min_roles: int = _MIN_ROLES_FOR_MATCH) -> bool:
+    return _count_recognized_roles(header_texts) >= min_roles
 
 
 def extract_layout_info(pdf_path: str | Path) -> Optional[dict]:
@@ -160,7 +192,7 @@ def _extract_layout_pymupdf(pdf_path: str | Path) -> Optional[dict]:
                 header_texts = cleaned
                 header_row_idx = idx
 
-        if not header_texts or not _is_layout_header_candidate(header_texts):
+        if not header_texts or not _is_layout_header_candidate(header_texts, min_roles=_MIN_ROLES_FOR_MATCH):
             doc.close()
             return None
 
@@ -231,7 +263,7 @@ def _extract_layout_pdfplumber(pdf_path: str | Path) -> Optional[dict]:
                     best_score = score
                     header_texts = cleaned
 
-            if not header_texts or not _is_layout_header_candidate(header_texts):
+            if not header_texts or not _is_layout_header_candidate(header_texts, min_roles=_MIN_ROLES_FOR_MATCH):
                 return None
 
             # Get x-positions from words on the page
@@ -382,6 +414,27 @@ def match_template(pdf_path: str | Path) -> Optional[dict]:
         increment_success_count(template["id"])
         return template
 
+    # Legacy fingerprint (pre-2026-04-11) — for templates saved before the
+    # Unicode-aware header change. Migrate the row to the new fingerprint
+    # on hit so the same template is found via the fast path next time.
+    legacy_fp = generate_legacy_fingerprint(
+        layout["header_texts"],
+        layout["column_count"],
+        layout["page_width"],
+    )
+    if legacy_fp != fingerprint:
+        template = find_template_by_fingerprint(legacy_fp)
+        if template:
+            logger.info(
+                "Template matched (legacy fingerprint, id=%s, bank=%s, uses=%d) — migrating",
+                template["id"],
+                template.get("bank_name", "unknown"),
+                template["success_count"],
+            )
+            update_template_fingerprint(template["id"], fingerprint)
+            increment_success_count(template["id"])
+            return template
+
     # Try fuzzy match
     template = find_template_fuzzy(layout["header_texts"], layout["column_count"])
     if template:
@@ -529,35 +582,55 @@ def detect_bank_name(pdf_path: str | Path) -> Optional[str]:
     return None
 
 
-def save_extraction_template(
+def save_extraction_template_detailed(
     pdf_path: str | Path,
     col_map: dict,
     strategy: str,
     transactions_count: int,
-) -> Optional[int]:
-    """Save a template after a successful extraction.
+) -> dict:
+    """Save a template after successful extraction, returning structured status.
 
-    Called by the extraction pipeline when no template was matched but
-    extraction succeeded. The layout is fingerprinted and stored for
-    future reuse.
-
-    Returns the template ID if saved, None otherwise.
+    Returns a dict with:
+      - template_id: int | None
+      - skipped: bool
+      - reason: str | None (populated when skipped)
+      - bank_name: str | None (populated when detected)
+      - headers: list[str] (populated when the gate rejected the layout)
     """
     if not DB_AVAILABLE:
-        return None
+        return {"template_id": None, "skipped": True, "reason": "db_unavailable"}
 
-    # Only save if we got a meaningful number of transactions
     if transactions_count < 3:
         logger.debug("Too few transactions (%d) to save template", transactions_count)
-        return None
+        return {
+            "template_id": None,
+            "skipped": True,
+            "reason": "too_few_transactions",
+        }
 
     layout = extract_layout_info(pdf_path)
     if not layout:
         logger.debug("Could not extract layout info for template saving")
-        return None
-    if not _is_layout_header_candidate(layout.get("header_texts", [])):
-        logger.warning("Skipping template save: detected header row is not trustworthy (%s)", layout.get("header_texts"))
-        return None
+        return {
+            "template_id": None,
+            "skipped": True,
+            "reason": "no_layout_info",
+        }
+    if not _is_layout_header_candidate(
+        layout.get("header_texts", []), min_roles=_MIN_ROLES_FOR_SAVE
+    ):
+        headers = layout.get("header_texts", [])
+        logger.warning(
+            "Skipping template save: headers did not meet save threshold "
+            "(need %d recognized roles @ confidence >= %.2f): %s",
+            _MIN_ROLES_FOR_SAVE, _HEADER_ROLE_CONF_MIN, headers,
+        )
+        return {
+            "template_id": None,
+            "skipped": True,
+            "reason": "headers_below_save_threshold",
+            "headers": headers,
+        }
 
     fingerprint = generate_fingerprint(
         layout["header_texts"],
@@ -616,5 +689,31 @@ def save_extraction_template(
             strategy,
             layout["header_texts"],
         )
+        return {
+            "template_id": template_id,
+            "skipped": False,
+            "reason": None,
+            "bank_name": bank_name,
+        }
 
-    return template_id
+    return {
+        "template_id": None,
+        "skipped": True,
+        "reason": "db_save_failed",
+        "bank_name": bank_name,
+    }
+
+
+def save_extraction_template(
+    pdf_path: str | Path,
+    col_map: dict,
+    strategy: str,
+    transactions_count: int,
+) -> Optional[int]:
+    """Backward-compatible wrapper that returns just the template_id."""
+    return save_extraction_template_detailed(
+        pdf_path=pdf_path,
+        col_map=col_map,
+        strategy=strategy,
+        transactions_count=transactions_count,
+    ).get("template_id")

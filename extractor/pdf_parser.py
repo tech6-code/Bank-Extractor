@@ -313,6 +313,86 @@ _DESC_FOOTER_MARKERS = [
 # (>= _FOOTER_MIN_POS chars in).  Short descriptions must not be destroyed.
 _FOOTER_MIN_POS = 30
 
+# Regex markers for page-header/account-metadata text that bleeds into the
+# description column on banks like Wio Business (where each statement page
+# repeats the account header above the transactions table). When any of these
+# patterns appears inside a description, everything from the match onward is
+# header contamination — truncate there. Patterns are highly specific to keep
+# false positives away from legitimate transaction text.
+#
+# Each marker is prefixed with a "company-name run" pattern so any trailing
+# all-caps tokens (e.g. "CLOUDFUSION CONSULTING - FZCO") preceding the marker
+# get stripped along with the marker itself. The prefix is case-sensitive on
+# purpose: it should NOT match real description text like "Subscription fee".
+_HDR_COMPANY_PREFIX = r"(?:\s+(?:[A-Z][A-Z0-9_&]+|-|,))*"
+
+_DESC_HEADER_FIELD_RES = [
+    # Wio "[Company Name] [CCY] N% FROM dd/mm/yyyy TO dd/mm/yyyy" header signature.
+    # Match the leading company-name run too so it's stripped along with the period.
+    re.compile(
+        r"(?:\s+[A-Z][A-Z0-9_-]*){0,6}\s+[A-Z]{3}\s+\d+%\s+FROM\s+"
+        r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\s+TO\s+"
+        r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}",
+        re.IGNORECASE,
+    ),
+    # Bare statement-period range "FROM dd/mm/yyyy TO dd/mm/yyyy"
+    re.compile(
+        r"\bFROM\s+\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\s+TO\s+"
+        r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
+        re.IGNORECASE,
+    ),
+    # Account header field labels followed by their value
+    re.compile(
+        r"\bACCOUNT\s+(?:NAME|NUMBER|TYPE|HOLDER|OPENED)\b",
+        re.IGNORECASE,
+    ),
+    # Balance header labels
+    re.compile(r"\b(?:OPENING|CLOSING)\s+BALANCE\b", re.IGNORECASE),
+    # Other Wio header literals
+    re.compile(r"\bINTEREST\s+RATE\b", re.IGNORECASE),
+    re.compile(r"\bCURRENT_ACCOUNT\b", re.IGNORECASE),
+    # Amount-column header text "(Incl. VAT)" / "(Incl VAT)" pulled into description
+    re.compile(r"\(\s*Incl\.?\s+VAT\s*\)", re.IGNORECASE),
+    # The following markers also swallow any preceding all-caps company-name run
+    # so "CLOUDFUSION CONSULTING - FZCO Dubai Silicon Oasis" all gets stripped.
+    # Standalone "ACCOUNT STATEMENT" literal mid-description (Wio header title)
+    re.compile(_HDR_COMPANY_PREFIX + r"\s+ACCOUNT\s+STATEMENT\b"),
+    # "Premises No" — address-line marker from registered-address blocks
+    re.compile(_HDR_COMPANY_PREFIX + r"\s+(?:IFZA\s+Business\s+Park|Premises\s+No\.?\s*[:\-]?)"),
+    re.compile(_HDR_COMPANY_PREFIX + r"\s+Dubai\s+Silicon\s+Oasis\b"),
+    re.compile(_HDR_COMPANY_PREFIX + r"\s+United\s+Arab\s+Emirates\b"),
+    # Long digit run (>=8 digits — IBAN tail / account number) followed by a date
+    # and one or two amounts. Matches the Wio header tail:
+    # "9548511337 28/07/2023 152,822.58 163,570.58"
+    re.compile(
+        _HDR_COMPANY_PREFIX +
+        r"\s+\d{8,}\s+\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"
+        r"(?:\s+[\d,]+(?:\.\d{2})?){1,2}\b"
+    ),
+]
+# These patterns are very specific so we use a lower threshold than _FOOTER_MIN_POS
+# — even short descriptions like "Bill" should not retain Wio-style header bleed.
+_DESC_HEADER_FIELD_MIN_POS = 5
+
+# Footer markers that legitimately appear inside transaction descriptions
+# (e.g. "INTEREST RATE 5%" can be a real credit row).  These ones only count
+# when they begin a line, never mid-sentence.
+_LINE_ANCHORED_FOOTER_MARKERS = frozenset({
+    "interest rate",
+    "statement date",
+    "subject to change",
+    "indicative only",
+    "current_account",
+    "main menu.",
+    "available balance as of",
+    "account opened",
+    "account holder name",
+    "online banking - go to relationship summary",
+    "select card>> block card",
+    "phone banking - call",
+    "banking / select card>>manage card >> block card",
+})
+
 # Regex: truncate at © symbol or start of Arabic/RTL block mid-description
 _DESC_POISON_RE = re.compile(
     r"©|\(c\)\s*\d{4}"                  # copyright mark
@@ -320,8 +400,16 @@ _DESC_POISON_RE = re.compile(
     r"|\bpo\s+box\b",                    # mailing address
     re.IGNORECASE,
 )
-# Strip trailing phone-number sequences from descriptions
-_TRAILING_PHONE_RE = re.compile(r"\s+\d[\d\s\-]{5,}\d\s*$")
+# Strip trailing phone-number sequences from descriptions.
+# Require either a + country prefix OR an actual space/dash separator inside
+# the digit run — pure digit sequences are usually transaction reference
+# numbers (e.g. "REF 1234567890") and must NOT be stripped.
+_TRAILING_PHONE_RE = re.compile(
+    r"\s+(?:"
+    r"\+\d{1,4}[\s\-]?\d[\d\s\-]{4,}\d"           # +971 4 123 4567
+    r"|\d{1,4}[\s\-]+\d{1,4}[\s\-]+\d[\d\s\-]*\d"  # 600 500 946 / 04-123-4567
+    r")\s*$"
+)
 
 # Column roles that, when appearing consecutively inside a description, indicate
 # that the next page's column header row was merged in.
@@ -352,6 +440,32 @@ def _append_description(base: str, extra: str) -> str:
     if not extra:
         return base
     return f"{base}\n{extra}"
+
+
+_PAGE_HEADER_ROW_KEYWORDS = (
+    "branch", "currency", "iban", "account number", "account no",
+    "account type", "account holder", "statement period", "statement date",
+    "page ", "page no", "page number", "transaction history",
+    "statement of account", "your bank statement",
+)
+
+
+def _row_looks_like_page_header(row: list[str]) -> bool:
+    """True when 2+ cells in a row carry page-header metadata keywords.
+
+    Continuation-row merging would otherwise glue page-header text from the
+    top of a new page onto the previous transaction's description.  A single
+    keyword can appear inside legitimate transaction text (e.g. "Branch" in a
+    payee name); requiring 2 distinct keyword hits across the row keeps that
+    case safe while catching real header rows.
+    """
+    if not row:
+        return False
+    combined = " ".join(c.strip() for c in row if c and c.strip()).lower()
+    if not combined:
+        return False
+    hits = sum(1 for kw in _PAGE_HEADER_ROW_KEYWORDS if kw in combined)
+    return hits >= 2
 
 
 def _is_standalone_amount_line(text: str) -> bool:
@@ -396,14 +510,48 @@ def _clean_description(description: str) -> str:
 
     # 1. Truncate at the EARLIEST known footer text marker — only when it appears
     #    far enough into the description that there is meaningful content before it.
+    #    For markers in _LINE_ANCHORED_FOOTER_MARKERS, only truncate when the
+    #    marker begins a line (start-of-string or after a newline) — those phrases
+    #    legitimately appear inside transaction descriptions and must not chop
+    #    real content mid-sentence.
     desc_lower = description.lower()
     earliest_cut = len(description)
     for marker in _DESC_FOOTER_MARKERS:
-        idx = desc_lower.find(marker)
-        if idx >= _FOOTER_MIN_POS and idx < earliest_cut:
-            earliest_cut = idx
+        if marker in _LINE_ANCHORED_FOOTER_MARKERS:
+            # Find marker only at start-of-string or right after a newline
+            search_from = 0
+            while True:
+                idx = desc_lower.find(marker, search_from)
+                if idx < 0:
+                    break
+                if idx == 0 or desc_lower[idx - 1] == "\n":
+                    if idx >= _FOOTER_MIN_POS and idx < earliest_cut:
+                        earliest_cut = idx
+                    break
+                search_from = idx + 1
+        else:
+            idx = desc_lower.find(marker)
+            if idx >= _FOOTER_MIN_POS and idx < earliest_cut:
+                earliest_cut = idx
     if earliest_cut < len(description):
         description = description[:earliest_cut].strip()
+        desc_lower = description.lower()
+
+    # 1b. Truncate at the earliest page-header field regex marker.
+    #     These catch metadata bleed (statement period, ACCOUNT NAME, IBAN-style
+    #     fields, column-header parentheticals) that follows the real description
+    #     when banks like Wio repeat the account header above each page's table.
+    earliest_regex_cut = len(description)
+    for pattern in _DESC_HEADER_FIELD_RES:
+        m = pattern.search(description)
+        if m and m.start() >= _DESC_HEADER_FIELD_MIN_POS and m.start() < earliest_regex_cut:
+            earliest_regex_cut = m.start()
+    # Bare IBAN inside description is also a page-header signal
+    iban_m = _IBAN_RE.search(description)
+    if iban_m and iban_m.start() >= _DESC_HEADER_FIELD_MIN_POS and iban_m.start() < earliest_regex_cut:
+        earliest_regex_cut = iban_m.start()
+    if earliest_regex_cut < len(description):
+        description = description[:earliest_regex_cut].strip()
         desc_lower = description.lower()
 
     # 2. Truncate at © or first Arabic character (clearly non-transaction content)
@@ -985,20 +1133,14 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
     # PyMuPDF uses visual ruling-line detection so it captures the first data row
     # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
     pymupdf_txns, pymupdf_col_map = _extract_from_pymupdf(pdf_path)
-    # If PyMuPDF found no transactions (no ruling lines / borderless PDF),
-    # skip pdfplumber entirely — its default strategy will also fail and
-    # its text-fallback is expensive but produces inferior results compared
-    # to the dedicated words/text strategies below.
-    if not pymupdf_txns:
-        logger.info("PyMuPDF found 0 transactions (borderless PDF?) — skipping pdfplumber, "
-                     "falling through to words/text strategies")
+    # Always run pdfplumber as co-primary: it catches tables PyMuPDF misses
+    # (borderless PDFs, mixed ruling styles). The quality-score picker below
+    # chooses the winner and discards the loser.
+    try:
+        pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
+    except Exception as e:
+        logger.warning(f"pdfplumber table extraction failed: {e}")
         pdfplumber_txns, pdfplumber_col_map = [], None
-    else:
-        try:
-            pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
-        except Exception as e:
-            logger.warning(f"pdfplumber table extraction failed: {e}")
-            pdfplumber_txns, pdfplumber_col_map = [], None
 
     pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
     pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
@@ -1623,7 +1765,23 @@ def _extract_from_tables(pdf_path: Path, forced_col_map: dict | None = None) -> 
                             date_idx = effective_map.get("date", 0)
                             date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
                             cur_desc_lines = transactions[-1]["description"].count("\n") + 1 if transactions[-1]["description"] else 0
-                            if not date_cell and cur_desc_lines < _MAX_CONTINUATION_LINES:
+                            # A row with amounts but no date is a failed-parse transaction,
+                            # not a continuation. Merging it would silently drop the row.
+                            row_has_amount = _row_has_amount_value(row, effective_map)
+                            if row_has_amount:
+                                logger.warning(
+                                    f"Page {page_num}, table {ti}, row {ri}: row has amount values "
+                                    f"but no date — not merging into previous description: "
+                                    f"{[c[:40] for c in row]}"
+                                )
+                            row_is_page_header = _row_looks_like_page_header(row)
+                            if row_is_page_header:
+                                logger.info(
+                                    f"Page {page_num}, table {ti}, row {ri}: row looks like "
+                                    f"page-header metadata — not merging into previous "
+                                    f"description: {[c[:40] for c in row]}"
+                                )
+                            if not date_cell and not row_has_amount and not row_is_page_header and cur_desc_lines < _MAX_CONTINUATION_LINES:
                                 # Collect text from all non-financial columns
                                 amount_cols = {
                                     effective_map.get(k)
@@ -2315,7 +2473,23 @@ def _extract_from_pymupdf(pdf_path: Path, forced_col_map: dict | None = None) ->
                             date_idx = col_map.get("date", 0)
                             date_cell = row[date_idx].strip() if isinstance(date_idx, int) and date_idx < len(row) else ""
                             cur_desc_lines = transactions[-1]["description"].count("\n") + 1 if transactions[-1]["description"] else 0
-                            if not date_cell and cur_desc_lines < _MAX_CONTINUATION_LINES:
+                            # A row with amounts but no date is a failed-parse transaction,
+                            # not a continuation. Merging it would silently drop the row.
+                            row_has_amount = _row_has_amount_value(row, col_map)
+                            if row_has_amount:
+                                logger.warning(
+                                    f"PyMuPDF page {page_num}, table {ti}, row {ri}: row has "
+                                    f"amount values but no date — not merging into previous "
+                                    f"description: {[c[:40] for c in row]}"
+                                )
+                            row_is_page_header = _row_looks_like_page_header(row)
+                            if row_is_page_header:
+                                logger.info(
+                                    f"PyMuPDF page {page_num}, table {ti}, row {ri}: row looks "
+                                    f"like page-header metadata — not merging into previous "
+                                    f"description: {[c[:40] for c in row]}"
+                                )
+                            if not date_cell and not row_has_amount and not row_is_page_header and cur_desc_lines < _MAX_CONTINUATION_LINES:
                                 amount_cols = {
                                     col_map.get(k)
                                     for k in ("debit", "credit", "balance", "amount")
@@ -2668,10 +2842,19 @@ def _row_to_transaction(row: list[str], col_map: dict) -> dict | None:
     if _split_year_recovered:
         description = re.sub(r"^\d{2}\s*", "", description, count=1)
     desc_lower = description.lower()
+    # Also catch headers that appear after a newline boundary inside a multiline
+    # description cell — pdfplumber sometimes merges a page-header line ABOVE
+    # the real transaction text into the same cell.
+    desc_lines_for_header = description.split("\n")
+    header_in_subsequent_line = any(
+        any(p.match(ln.lstrip()) for p in _DESC_HEADER_RES)
+        for ln in desc_lines_for_header[1:]
+    )
     header_was_contaminated = (
         any(p.match(description) for p in _DESC_HEADER_RES)
+        or header_in_subsequent_line
         or (
-            len(description) > 80
+            len(description) > 40
             and (
                 bool(_PAGE_META_FIELD_RE.search(description[:220]))
                 or any(phrase in desc_lower for phrase in _SOFT_SKIP_PHRASES)
@@ -3012,6 +3195,21 @@ def _detect_word_columns(words: list[dict]) -> dict | None:
     }
 
 
+def _row_has_amount_value(row: list, col_map: dict) -> bool:
+    """True if any amount-type column in the row contains a real numeric value.
+
+    Used to distinguish a true continuation row (text-only) from a failed-parse
+    transaction row where the date cell came back empty due to table-detection
+    wobble. Merging the latter into the previous transaction silently drops it.
+    """
+    for key in ("debit", "credit", "amount", "balance"):
+        idx = col_map.get(key)
+        if isinstance(idx, int) and 0 <= idx < len(row):
+            if _clean_amount(str(row[idx] or "")):
+                return True
+    return False
+
+
 def _is_noise_line(line: str) -> bool:
     """Check if a line is noise (headers, footers, metadata) — not transaction content."""
     stripped = line.strip()
@@ -3121,21 +3319,69 @@ def _is_noise_line(line: str) -> bool:
     if "©" in line:
         return True
     ascii_alnum = sum(1 for c in line if c.isascii() and c.isalnum())
-    arabic_chars = len(re.findall(r"[\u0600-\u06FF]", line))
+    arabic_chars = len(re.findall(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]", line))
     if arabic_chars > 0 and ascii_alnum < 5 and len(line) > 5:
         return True
+    # Predominantly-Arabic disclaimer lines (e.g. the trailing Mashreq footer
+    # "accurate. <Arabic ...>") have some ASCII content but the Arabic clearly
+    # dominates \u2014 treat those as noise too.
+    if arabic_chars > 10 and arabic_chars > ascii_alnum * 2:
+        return True
     return False
+
+
+_REF_ONLY_DESC_RE = re.compile(r"(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{6,30}")
+# A token with ≥10 chars looks like a bank reference code when it's either
+# alphanumeric mixed (e.g. "035PF07250077139", "030POSB250160SQv") or pure
+# digits (e.g. "0352663250350456" — too long to be a comma-less amount).
+# When such a token is the LAST whitespace-separated chunk of a date-line's
+# description, the date line carries no real narration text and the prefix
+# from the line above (Mashreq layout) should be used as the description.
+_REF_LIKE_TOKEN_RE = re.compile(
+    r"(?:"
+    r"(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{10,}"   # mixed letters+digits, ≥10 chars
+    r"|\d{10,}"                                   # pure digits, ≥10 chars
+    r"|0\d{4,}"                                   # leading-zero pure digits
+    r")"
+)
+
+
+def _attach_continuation_to_prev(transactions: list[dict], lines: list[str]) -> None:
+    """Attach a list of pending text lines to the previous transaction's description."""
+    if not transactions or not lines:
+        return
+    prev = transactions[-1]
+    for line in lines:
+        if not line:
+            continue
+        if _is_noise_line(line) or _is_standalone_amount_line(line):
+            continue
+        prev["description"] = _clean_description(
+            _append_description(prev["description"], line)
+        )
 
 
 def _extract_from_text(pdf_path: Path) -> list[dict]:
     """Extract transactions by parsing raw text lines from the PDF.
 
-    Handles multi-line transactions where description lines appear
-    before and/or after the date+amount line.
+    Each transaction's description may have one prefix line BEFORE the date+amount
+    line and any number of suffix lines AFTER it. To distinguish prefix-of-next
+    from suffix-of-previous, non-date lines are buffered in ``pending_desc_lines``
+    until the next date line arrives:
+
+      * If the date line's own description is empty or just a ref code, the LAST
+        pending line is treated as the prefix for the new transaction and earlier
+        pending lines become suffix for the previous transaction.
+      * Otherwise all pending lines become suffix for the previous transaction.
+
+    Page metadata that leaks past the noise filter still reaches the buffer; it
+    only causes harm if it ends up as ``pending[-1]`` when the first date line
+    on a page arrives. The opening-balance check runs BEFORE the noise filter so
+    statements that label their opening balance with a SKIP_PHRASES word (e.g.
+    Mashreq's "Opening balance 104,477.54") still seed prev_balance.
     """
-    transactions = []
-    prev_balance = None
-    pending_desc_lines = []  # Non-date lines accumulated before a date line
+    transactions: list[dict] = []
+    prev_balance: float | None = None
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
@@ -3147,40 +3393,54 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
             if not text:
                 continue
 
+            pending_desc_lines: list[str] = []
+
             for line in text.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
 
-                # Skip noise lines
-                if _is_noise_line(line):
-                    # Don't clear pending — noise can appear between desc and date lines
-                    continue
-
-                # Try to capture opening balance from lines like "Balance Brought FWD 33,087.14"
+                # Capture opening balance BEFORE the noise filter — many banks
+                # label this line "Opening balance ..." which SKIP_PHRASES kills.
                 if prev_balance is None:
                     bal_match = re.search(
                         r"(?:balance\s+brought|opening\s+balance|b[/.]?f)\b.*?([\d,]+(?:\.\d{1,2})?)\s*$",
                         line, re.IGNORECASE,
                     )
                     if bal_match:
-                        prev_balance = float(bal_match.group(1).replace(",", ""))
+                        try:
+                            prev_balance = float(bal_match.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
                         continue
+
+                if _is_noise_line(line):
+                    continue
 
                 txn = _parse_text_line(line, prev_balance)
                 if txn:
-                    # Prepend accumulated description lines (but only if we've
-                    # already seen at least one transaction — lines before the
-                    # first transaction are page headers / account info, not
-                    # description continuations)
-                    if pending_desc_lines and transactions:
-                        pre_desc = " ".join(pending_desc_lines)
-                        if txn["description"]:
+                    desc = (txn.get("description") or "").strip()
+                    desc_is_just_ref = bool(_REF_ONLY_DESC_RE.fullmatch(desc))
+                    last_token = desc.rsplit(None, 1)[-1] if desc else ""
+                    desc_ends_with_ref = bool(_REF_LIKE_TOKEN_RE.fullmatch(last_token))
+
+                    if pending_desc_lines and (not desc or desc_is_just_ref or desc_ends_with_ref):
+                        # Mashreq-style layout: the line right above the date
+                        # line is the description prefix for this transaction.
+                        # Triggered when the date line carries no real narration
+                        # text — only a ref code (or an IBAN+ref pair).
+                        prefix_line = pending_desc_lines[-1]
+                        suffix_for_prev = pending_desc_lines[:-1]
+                        if desc:
                             txn["description"] = _clean_description(
-                                _append_description(pre_desc, txn["description"])
+                                _append_description(prefix_line, desc)
                             )
                         else:
-                            txn["description"] = _normalize_multiline_text(pre_desc)
+                            txn["description"] = _normalize_multiline_text(prefix_line)
+                    else:
+                        suffix_for_prev = list(pending_desc_lines)
+
+                    _attach_continuation_to_prev(transactions, suffix_for_prev)
                     pending_desc_lines = []
 
                     transactions.append(txn)
@@ -3189,60 +3449,50 @@ def _extract_from_text(pdf_path: Path) -> list[dict]:
                             prev_balance = float(txn["balance"].replace(",", ""))
                         except ValueError:
                             pass
-                else:
-                    # Non-date line: accumulate as description
-                    # If we just processed a transaction (pending is empty),
-                    # this is a continuation line for the previous transaction
-                    if transactions and not pending_desc_lines:
-                        prev = transactions[-1]
-                        # Check if this line is a standalone balance value
-                        # (e.g. "8,390.6" or "33,580.1" on its own line after a transaction)
-                        stripped = line.strip().replace(",", "")
-                        # Use flexible regex: allow 0-2 decimal places (some banks
-                        # print "33,580.1" or "24,303" without trailing zeros)
-                        is_balance_line = (
-                            not prev.get("balance")
-                            and re.fullmatch(r"[+\-]?[\d]+(?:\.\d{1,2})?", stripped)
-                            and not DATE_START_RE.match(line)
-                        )
-                        if is_balance_line:
-                            bal_val = stripped.lstrip("+-")
-                            new_balance = float(bal_val)
-                            prev["balance"] = f"{new_balance:,.2f}"
-                            # Reclassify debit/credit using balance delta when
-                            # the original classification was uncertain (single
-                            # amount with no balance on the date line).
-                            amt_str = prev.get("debit") or prev.get("credit") or ""
-                            if amt_str and prev_balance is not None:
-                                try:
-                                    amt_val = float(amt_str.replace(",", ""))
-                                    if new_balance < prev_balance - 0.5:
-                                        # Balance decreased → debit
-                                        prev["debit"] = f"{amt_val:,.2f}"
-                                        prev["credit"] = ""
-                                    elif new_balance > prev_balance + 0.5:
-                                        # Balance increased → credit
-                                        prev["debit"] = ""
-                                        prev["credit"] = f"{amt_val:,.2f}"
-                                except ValueError:
-                                    pass
-                            prev_balance = new_balance
-                        else:
-                            # IBAN at start → new transaction reference, not continuation
-                            line_stripped_slash = line.lstrip("/")
-                            if _IBAN_RE.match(line_stripped_slash):
-                                pending_desc_lines = []
-                            elif not _is_noise_line(line) and not _is_standalone_amount_line(line):
-                                prev["description"] = _clean_description(
-                                    _append_description(prev["description"], line)
-                                )
-                    else:
-                        # IBAN at start → new transaction reference, not continuation
-                        line_stripped_slash = line.lstrip("/")
-                        if _IBAN_RE.match(line_stripped_slash):
-                            pending_desc_lines = []
-                        elif not _is_noise_line(line) and not _is_standalone_amount_line(line):
-                            pending_desc_lines.append(line)
+                    continue
+
+                # Non-date line: balance-on-its-own-line OR continuation buffer.
+                # Require a decimal point or thousands-comma so bare reference
+                # fragments like "921944" don't get misread as a balance value.
+                raw_line = line.strip()
+                stripped = raw_line.replace(",", "")
+                looks_like_amount = re.fullmatch(r"[+\-]?[\d,]+(?:\.\d{1,2})?", raw_line) is not None
+                has_separator = "." in raw_line or "," in raw_line
+                is_balance_line = (
+                    transactions
+                    and not transactions[-1].get("balance")
+                    and looks_like_amount
+                    and has_separator
+                    and not DATE_START_RE.match(line)
+                )
+                if is_balance_line:
+                    prev = transactions[-1]
+                    new_balance = float(stripped.lstrip("+-"))
+                    prev["balance"] = f"{new_balance:,.2f}"
+                    amt_str = prev.get("debit") or prev.get("credit") or ""
+                    if amt_str and prev_balance is not None:
+                        try:
+                            amt_val = float(amt_str.replace(",", ""))
+                            if new_balance < prev_balance - 0.5:
+                                prev["debit"] = f"{amt_val:,.2f}"
+                                prev["credit"] = ""
+                            elif new_balance > prev_balance + 0.5:
+                                prev["debit"] = ""
+                                prev["credit"] = f"{amt_val:,.2f}"
+                        except ValueError:
+                            pass
+                    prev_balance = new_balance
+                    continue
+
+                if _is_standalone_amount_line(line):
+                    continue
+
+                pending_desc_lines.append(line)
+
+            # End of page: any remaining pending lines are continuation for the
+            # last transaction (the next page's first lines will repopulate the
+            # buffer fresh, so a prefix on page N+1 cannot leak across).
+            _attach_continuation_to_prev(transactions, pending_desc_lines)
 
     return transactions
 
@@ -3340,6 +3590,25 @@ def _parse_text_line(line: str, prev_balance: float | None = None) -> dict | Non
             and 1900 <= int(first_val) <= 2099
         )
         if is_plain_year and len(trailing_amounts) >= 3:
+            trailing_amounts.pop(0)
+            continue
+        # Reject pure-digit tokens that look like reference numbers, not amounts:
+        #   - 10+ digits with no separator (any real bank amount that large would
+        #     be comma-grouped, e.g. "1,234,567,890")
+        #   - 5+ digits with a leading zero (legitimate amounts don't have
+        #     leading zeros; ref codes like "0352663250350456" do)
+        is_ref_like_digits = (
+            not has_decimal
+            and not has_comma
+            and not is_negative
+            and not is_explicit_plus
+            and first_val.isdigit()
+            and (
+                len(first_val) >= 10
+                or (first_val.startswith("0") and len(first_val) >= 5)
+            )
+        )
+        if is_ref_like_digits:
             trailing_amounts.pop(0)
             continue
         if not has_decimal and not is_negative and not is_explicit_plus and not is_large:
@@ -3465,6 +3734,10 @@ def _strip_leading_ref(description: str) -> str:
     Handles standalone short numeric codes (e.g. "00001 Monthly Maintenance Fee")
     that appear when the main ref was on a separate line in multi-line transactions.
     """
+    # IBAN prefix (e.g. "AE060500...") is legitimate transaction data — the
+    # recipient/sender IBAN, not a column-bleed ref code. Keep it intact.
+    if _IBAN_RE.match(description):
+        return description
     m = _REF_CODE_RE.match(description)
     if m:
         remainder = description[m.end():].strip()

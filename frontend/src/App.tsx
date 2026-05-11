@@ -35,7 +35,18 @@ interface TemplateInfo {
   template_id?: number;
   template_bank_name?: string;
   template_saved?: boolean;
+  template_save_reason?: string;
+  template_save_headers?: string[];
 }
+
+const TEMPLATE_SAVE_REASONS: Record<string, string> = {
+  too_few_transactions: "Too few transactions to save as a template",
+  no_layout_info: "Layout could not be detected",
+  headers_below_save_threshold: "Headers didn't meet the quality threshold",
+  db_save_failed: "Database save failed",
+  db_unavailable: "Template database not configured",
+  exception: "Error while saving template",
+};
 
 interface ValidationMismatch {
   row_index: number;
@@ -484,6 +495,18 @@ function App() {
                       New template saved{result.template.template_bank_name ? `: ${result.template.template_bank_name}` : ""}
                     </span>
                     <Badge variant="secondary" className="bg-blue-500/10 text-blue-400 border-0 text-[10px] uppercase">
+                      {result.template.strategy}
+                    </Badge>
+                  </div>
+                ) : result.template.template_saved === false ? (
+                  <div className="flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-1.5">
+                    <svg className="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m0 3.75h.008v.008H12V16.5Zm0-13.5L1.5 21h21L12 3Z" />
+                    </svg>
+                    <span className="text-xs text-amber-300 font-medium">
+                      Template not saved — {TEMPLATE_SAVE_REASONS[result.template.template_save_reason || ""] || result.template.template_save_reason || "unknown reason"}
+                    </span>
+                    <Badge variant="secondary" className="bg-amber-500/10 text-amber-400 border-0 text-[10px] uppercase">
                       {result.template.strategy}
                     </Badge>
                   </div>
