@@ -341,16 +341,17 @@ _DESC_HEADER_FIELD_RES = [
         r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
         re.IGNORECASE,
     ),
-    # Account header field labels followed by their value
-    re.compile(
-        r"\bACCOUNT\s+(?:NAME|NUMBER|TYPE|HOLDER|OPENED)\b",
-        re.IGNORECASE,
-    ),
-    # Balance header labels
-    re.compile(r"\b(?:OPENING|CLOSING)\s+BALANCE\b", re.IGNORECASE),
-    # Other Wio header literals
-    re.compile(r"\bINTEREST\s+RATE\b", re.IGNORECASE),
-    re.compile(r"\bCURRENT_ACCOUNT\b", re.IGNORECASE),
+    # Account header field labels followed by their value.
+    # Case-SENSITIVE on purpose: Wio-style page headers are uppercase
+    # ("ACCOUNT NUMBER 12345..."), while legitimate transaction descriptions
+    # use mixed case ("Account Number 80309100036511 To ..."). Matching
+    # case-insensitively would chop real cheque/transfer descriptions.
+    re.compile(r"\bACCOUNT\s+(?:NAME|NUMBER|TYPE|HOLDER|OPENED)\b"),
+    # Balance header labels (uppercase only — same reasoning).
+    re.compile(r"\b(?:OPENING|CLOSING)\s+BALANCE\b"),
+    # Other Wio header literals (uppercase only).
+    re.compile(r"\bINTEREST\s+RATE\b"),
+    re.compile(r"\bCURRENT_ACCOUNT\b"),
     # Amount-column header text "(Incl. VAT)" / "(Incl VAT)" pulled into description
     re.compile(r"\(\s*Incl\.?\s+VAT\s*\)", re.IGNORECASE),
     # The following markers also swallow any preceding all-caps company-name run
@@ -373,6 +374,14 @@ _DESC_HEADER_FIELD_RES = [
 # These patterns are very specific so we use a lower threshold than _FOOTER_MIN_POS
 # — even short descriptions like "Bill" should not retain Wio-style header bleed.
 _DESC_HEADER_FIELD_MIN_POS = 5
+# Mid-line matches (i.e. matches NOT at the start of a continuation line) are
+# treated as suspicious — they may be legitimate transaction text. Require the
+# match to sit this far into the description before considering a mid-line cut.
+_DESC_HEADER_DEEP_POS = 60
+# Safety guard: never truncate a description so aggressively that less than this
+# fraction of its original length is kept (unless the match is line-anchored,
+# which is a strong header-bleed signal).
+_DESC_HEADER_MIN_KEEP_RATIO = 0.5
 
 # Footer markers that legitimately appear inside transaction descriptions
 # (e.g. "INTEREST RATE 5%" can be a real credit row).  These ones only count
@@ -541,14 +550,41 @@ def _clean_description(description: str) -> str:
     #     These catch metadata bleed (statement period, ACCOUNT NAME, IBAN-style
     #     fields, column-header parentheticals) that follows the real description
     #     when banks like Wio repeat the account header above each page's table.
+    #
+    #     Two acceptance rules:
+    #       (a) Line-anchored match — the match sits at the start of a continuation
+    #           line (preceded only by whitespace after a newline). This is the
+    #           strong header-bleed signal: real bleed almost always follows a
+    #           line break in the cell. Accepted at the basic _DESC_HEADER_FIELD_MIN_POS.
+    #       (b) Mid-line match — match sits inside a line of running text. This is
+    #           riskier (could be legitimate "valid FROM dd/mm/yyyy TO dd/mm/yyyy"
+    #           transaction text). Require both _DESC_HEADER_DEEP_POS depth AND
+    #           that the cut keeps at least _DESC_HEADER_MIN_KEEP_RATIO of the
+    #           original text.
     earliest_regex_cut = len(description)
+    desc_len = len(description)
+
+    def _accept_header_match(pos: int) -> bool:
+        if pos < _DESC_HEADER_FIELD_MIN_POS:
+            return False
+        last_nl = description.rfind("\n", 0, pos)
+        line_anchored = last_nl >= 0 and description[last_nl + 1:pos].strip() == ""
+        if line_anchored:
+            return True
+        # Mid-line match: stricter guards
+        if pos < _DESC_HEADER_DEEP_POS:
+            return False
+        if pos < desc_len * _DESC_HEADER_MIN_KEEP_RATIO:
+            return False
+        return True
+
     for pattern in _DESC_HEADER_FIELD_RES:
         m = pattern.search(description)
-        if m and m.start() >= _DESC_HEADER_FIELD_MIN_POS and m.start() < earliest_regex_cut:
+        if m and _accept_header_match(m.start()) and m.start() < earliest_regex_cut:
             earliest_regex_cut = m.start()
     # Bare IBAN inside description is also a page-header signal
     iban_m = _IBAN_RE.search(description)
-    if iban_m and iban_m.start() >= _DESC_HEADER_FIELD_MIN_POS and iban_m.start() < earliest_regex_cut:
+    if iban_m and _accept_header_match(iban_m.start()) and iban_m.start() < earliest_regex_cut:
         earliest_regex_cut = iban_m.start()
     if earliest_regex_cut < len(description):
         description = description[:earliest_regex_cut].strip()
@@ -1398,9 +1434,10 @@ def _extraction_quality_score(transactions: list[dict]) -> float:
       - More transactions with financial data score higher
       - Transactions missing both debit and credit are penalised (worth 0.1)
       - Having a balance value adds a small bonus per row (0.3)
+      - Descriptions of decent length add a small bonus per row (up to 0.2)
 
-    This prevents a strategy that extracts 200 garbage rows (no amounts)
-    from beating one that correctly extracts 80 real transactions.
+    The description-length bonus prevents a strategy that extracts the same row
+    count with truncated descriptions from beating one with full descriptions.
     """
     if not transactions:
         return 0.0
@@ -1409,6 +1446,11 @@ def _extraction_quality_score(transactions: list[dict]) -> float:
         has_amount = bool(t.get("debit") or t.get("credit"))
         has_balance = bool(t.get("balance"))
         row_score = (0.7 if has_amount else 0.1) + (0.3 if has_balance else 0.0)
+        desc_len = len(str(t.get("description", "") or "").strip())
+        if desc_len >= 40:
+            row_score += 0.2
+        elif desc_len >= 20:
+            row_score += 0.1
         score += row_score
     return score
 
@@ -2237,6 +2279,14 @@ def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) 
 
         missed: list[dict] = []
         processed_tops: set[int] = set()
+        # Multi-line description recovery: when a date-row has continuation lines
+        # below it (descriptions that span multiple visual lines in the PDF), the
+        # following non-date bands carry the rest of that description. Append them
+        # to the prior date-row's description until we hit either the next date-row
+        # or _MAX_CONTINUATION_Y pixels below the date-row.
+        _MAX_CONTINUATION_Y = 60
+        last_candidate: dict | None = None
+        last_candidate_top: int | None = None
 
         for top in sorted(lines_by_top.keys()):
             if top in processed_tops:
@@ -2258,9 +2308,46 @@ def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) 
             if not line_words:
                 continue
 
-            # Only process bands whose leftmost word is a date.
             first_text = line_words[0]["text"]
-            if not any(p.match(first_text) for p in DATE_PATTERNS):
+            is_date_row = any(p.match(first_text) for p in DATE_PATTERNS)
+
+            if not is_date_row:
+                # Continuation row: append description-zone words to the prior
+                # date-row's description, but only while we're still within the
+                # vertical proximity of that row. Once we drift further than
+                # _MAX_CONTINUATION_Y we assume the prior row has ended.
+                if last_candidate is None or last_candidate_top is None:
+                    continue
+                if top - last_candidate_top > _MAX_CONTINUATION_Y:
+                    last_candidate = None
+                    last_candidate_top = None
+                    continue
+                # Stop continuation when the band looks like a footer/summary
+                # line (e.g. "Opening balance :", "Total debit amount :",
+                # "Credit count :") — those are not transaction text.
+                band_text_lower = " ".join(w["text"] for w in line_words).lower()
+                if any(phrase in band_text_lower for phrase in SKIP_PHRASES):
+                    last_candidate = None
+                    last_candidate_top = None
+                    continue
+                cont_parts: list[str] = []
+                for w in line_words:
+                    x = w["x0"]
+                    text = w["text"]
+                    if AMOUNT_RE.match(text.replace(",", "").lstrip("+-")):
+                        continue
+                    if text.rstrip(".").upper() in ("CR", "DR"):
+                        continue
+                    if x >= col_boundaries["balance_x"] - 15:
+                        continue
+                    cont_parts.append(text)
+                if cont_parts:
+                    extra = " ".join(cont_parts)
+                    extra = re.sub(r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}\b", "", extra)
+                    extra = re.sub(r"\s+", " ", extra).strip()
+                    if extra:
+                        prev = last_candidate["description"]
+                        last_candidate["description"] = (prev + "\n" + extra).strip() if prev else extra
                 continue
 
             # Extract field values by x-position (same logic as _extract_from_words).
@@ -2320,16 +2407,30 @@ def _find_missed_rows_word_scan(page, captured_txns: list[dict], col_map: dict) 
             desc = " ".join(description_parts)
             desc = re.sub(r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4}\b", "", desc)
             desc = re.sub(r"\s+", " ", desc).strip()
+            # Strip a leading reference/transaction code (the Reference No column
+            # often falls inside the description x-zone, e.g. Banque Misr's
+            # "803C002AED000001 Credit Interest" → "Credit Interest").
+            desc = _strip_leading_ref(desc)
 
             candidate = {"date": date, "description": desc,
                          "debit": debit, "credit": credit, "balance": balance}
 
             # Skip if already captured.
             if _key(candidate) in captured_keys:
+                last_candidate = None
+                last_candidate_top = None
                 continue
 
             missed.append(candidate)
             captured_keys.add(_key(candidate))  # Avoid duplicating within this scan
+            last_candidate = candidate
+            last_candidate_top = top
+
+        # Final pass: clean up descriptions after continuation lines have been
+        # appended. _clean_description handles footer markers, header bleed, and
+        # multi-line noise lines.
+        for txn in missed:
+            txn["description"] = _clean_description(txn["description"])
 
         return missed
 
@@ -3253,10 +3354,23 @@ def _is_noise_line(line: str) -> bool:
         return True
     if "statement period" in line_lower or "date issued" in line_lower:
         return True
-    if "account type" in line_lower or "account number" in line_lower:
-        return True
-    if "account holder" in line_lower:
-        return True
+    # "Account Type / Number / Holder" lines are noise ONLY when the line is a
+    # labeled metadata field (e.g. "Account Number: 12345678" or
+    # "Account Number 12345678" with nothing else after). Real transaction
+    # descriptions for cheque transfers often contain phrases like
+    # "Account Number 80309100036511 To Account Number 80309100024534" —
+    # those must NOT be discarded.
+    _acct_field = re.match(
+        r"^\s*account\s+(?:type|number|holder)\b\s*:?\s*",
+        line_lower,
+    )
+    if _acct_field:
+        rest = line_lower[_acct_field.end():].strip()
+        # Empty rest → bare label. Pure digit/dash/space rest → labeled value.
+        if not rest or re.fullmatch(r"[\d\-\s]*", rest):
+            return True
+        # Otherwise the words after "Account Number" are transaction prose
+        # (e.g. "... To Account Number XYZ ...") — keep the line.
     if "current account transactions" in line_lower:
         return True
     if line_lower.startswith("iban:") or line_lower.startswith("branch:") or line_lower.startswith("currency:"):

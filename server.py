@@ -4,6 +4,7 @@ from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -54,6 +55,9 @@ FILE_TTL_SECONDS = 3600  # 1 hour
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "50"))
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
+# Max seconds a single extraction can run before the request is failed with 504.
+# Prevents a runaway PDF from holding a worker indefinitely.
+EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "300"))
 
 
 def _purge_stale_files() -> None:
@@ -198,7 +202,21 @@ async def extract_preview(file: UploadFile, password: str | None = Form(default=
             logger.warning(f"Template matching failed (continuing without): {e}")
 
         # ── Extraction ────────────────────────────────────────────────────
-        raw_transactions = extract_transactions(str(working_pdf_path), template=template)
+        # Run the synchronous CPU-heavy extractor in a worker thread so the
+        # FastAPI event loop stays responsive to other requests, and bound it
+        # with a hard timeout so a runaway PDF cannot block a worker forever.
+        try:
+            raw_transactions = await asyncio.wait_for(
+                asyncio.to_thread(extract_transactions, str(working_pdf_path), template=template),
+                timeout=EXTRACTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Extraction timed out after {EXTRACTION_TIMEOUT_SECONDS}s for {file.filename}")
+            raise HTTPException(
+                504,
+                f"Extraction took longer than {EXTRACTION_TIMEOUT_SECONDS}s and was cancelled. "
+                "The PDF may be too large or complex.",
+            )
         transactions, meta = _separate_meta(raw_transactions)
         logger.info(f"Extracted {len(transactions)} transactions")
     except HTTPException:
@@ -441,4 +459,16 @@ async def update_template(template_id: int, body: dict):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # Dev:  python server.py                    (or set APP_ENV=dev)
+    # Prod: APP_ENV=prod APP_WORKERS=4 python server.py
+    # On Windows, multiple workers are supported via uvicorn directly.
+    is_dev = os.getenv("APP_ENV", "dev").lower() != "prod"
+    workers = int(os.getenv("APP_WORKERS", "1"))
+    uvicorn.run(
+        "server:app",
+        host=os.getenv("APP_HOST", "0.0.0.0"),
+        port=int(os.getenv("APP_PORT", "8000")),
+        reload=is_dev,
+        workers=workers if not is_dev else None,
+        timeout_keep_alive=int(os.getenv("APP_KEEPALIVE", "30")),
+    )
