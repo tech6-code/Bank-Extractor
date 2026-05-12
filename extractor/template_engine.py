@@ -118,38 +118,46 @@ def _is_layout_header_candidate(header_texts: list[str], min_roles: int = _MIN_R
 
 
 def extract_layout_info(pdf_path: str | Path) -> Optional[dict]:
-    """Extract layout information from the first page of a PDF.
+    """Extract layout information from a PDF.
 
-    Returns a dict with:
-    - header_texts: list of detected header strings
-    - header_x_positions: list of x-coordinates for each header
-    - column_count: number of columns detected
-    - page_width: page width in points
-    - page_height: page height in points
-    - raw_table: first table data (for fallback column detection)
+    Tries PyMuPDF (visual table detection), pdfplumber lines strategy, and
+    pdfplumber text strategy. Each may return a *candidate* layout. We pick
+    the one with the highest count of recognised column roles — so a page-1
+    "Account Summary" table (1 role: balance) loses to a transactions-table
+    layout with date+description+debit+credit+balance (5 roles).
 
-    Returns None if no table structure is found on the first page.
+    Returns None if no strategy finds any usable layout.
     """
-    # Try PyMuPDF first (visual table detection)
-    layout = _extract_layout_pymupdf(pdf_path)
-    if layout:
-        return layout
+    candidates: list[dict] = []
+    for fn in (_extract_layout_pymupdf, _extract_layout_pdfplumber, _extract_layout_pdfplumber_text):
+        try:
+            layout = fn(pdf_path)
+        except Exception as e:
+            logger.debug("%s raised: %s", fn.__name__, e)
+            layout = None
+        if layout:
+            candidates.append(layout)
 
-    # Fallback to pdfplumber (lines strategy)
-    layout = _extract_layout_pdfplumber(pdf_path)
-    if layout:
-        return layout
+    if not candidates:
+        return None
 
-    # Last resort: pdfplumber text strategy (for PDFs with no ruling lines)
-    layout = _extract_layout_pdfplumber_text(pdf_path)
-    if layout:
-        return layout
+    def _quality(layout: dict) -> int:
+        return _count_recognized_roles(layout.get("header_texts", []))
 
-    return None
+    # Highest recognised-role count wins; preserve discovery order on ties so
+    # the visual-table strategies are preferred when quality is equal.
+    return max(candidates, key=_quality)
 
 
 def _extract_layout_pymupdf(pdf_path: str | Path) -> Optional[dict]:
-    """Extract layout info using PyMuPDF's visual table finder."""
+    """Extract layout info using PyMuPDF's visual table finder.
+
+    Scans the first several pages and picks the table whose header row scores
+    highest under `_header_row_score`. The first page often holds an account
+    summary (Account / Currency / IBAN / Balance), which is the wrong shape
+    for transaction-template fingerprinting. The transactions table usually
+    lives on page 2+ and has Date + Description + at least one amount column.
+    """
     try:
         import fitz
     except ImportError:
@@ -161,77 +169,76 @@ def _extract_layout_pymupdf(pdf_path: str | Path) -> Optional[dict]:
             doc.close()
             return None
 
-        page = doc[0]
-        page_width = page.rect.width
-        page_height = page.rect.height
-
-        tabs = page.find_tables()
-        if not tabs or len(tabs.tables) == 0:
-            doc.close()
-            return None
-
-        # Use the largest table on the first page
-        best_table = max(tabs.tables, key=lambda t: len(t.extract()))
-        table_data = best_table.extract()
-
-        if not table_data or len(table_data) < 2:
-            doc.close()
-            return None
-
-        column_count = len(table_data[0])
-
-        # Prefer an actual header row, not the first non-empty data row.
-        header_texts = []
-        header_row_idx = 0
+        best_layout: dict | None = None
         best_score = -1
-        for idx in range(min(6, len(table_data))):
-            row = table_data[idx]
-            score, cleaned = _header_row_score(row)
-            if score > best_score:
-                best_score = score
-                header_texts = cleaned
-                header_row_idx = idx
 
-        if not header_texts or not _is_layout_header_candidate(header_texts, min_roles=_MIN_ROLES_FOR_MATCH):
-            doc.close()
-            return None
+        for page_idx in range(min(5, len(doc))):
+            page = doc[page_idx]
+            page_width = page.rect.width
+            page_height = page.rect.height
 
-        # Get x-positions from table column boundaries
-        header_x_positions = []
-        if hasattr(best_table, 'cells') and best_table.cells:
-            seen_cols = {}
-            for cell in best_table.cells:
-                # cell is (x0, y0, x1, y1, row, col, ...)
-                if len(cell) >= 6:
-                    col_idx = cell[5] if len(cell) > 5 else cell[4]
-                    if col_idx not in seen_cols:
-                        seen_cols[col_idx] = cell[0]
-            header_x_positions = [seen_cols.get(i, 0) for i in range(column_count)]
+            tabs = page.find_tables()
+            if not tabs or len(tabs.tables) == 0:
+                continue
 
-        if not header_x_positions:
-            # Fallback: evenly spaced based on page width
-            header_x_positions = [
-                (page_width / column_count) * i for i in range(column_count)
-            ]
+            for tab in tabs.tables:
+                table_data = tab.extract()
+                if not table_data or len(table_data) < 2:
+                    continue
+                column_count = len(table_data[0])
+
+                # Pick the strongest header row in the first 6 rows of this table.
+                hdr_texts: list[str] = []
+                hdr_score = -1
+                hdr_idx = 0
+                for idx in range(min(6, len(table_data))):
+                    score, cleaned = _header_row_score(table_data[idx])
+                    if score > hdr_score:
+                        hdr_score = score
+                        hdr_texts = cleaned
+                        hdr_idx = idx
+                if not hdr_texts or hdr_score <= best_score:
+                    continue
+                if not _is_layout_header_candidate(hdr_texts, min_roles=_MIN_ROLES_FOR_MATCH):
+                    continue
+
+                # Build x-positions for THIS table.
+                header_x_positions: list[float] = []
+                if hasattr(tab, "cells") and tab.cells:
+                    seen_cols: dict[int, float] = {}
+                    for cell in tab.cells:
+                        if len(cell) >= 6:
+                            col_idx = cell[5] if len(cell) > 5 else cell[4]
+                            if col_idx not in seen_cols:
+                                seen_cols[col_idx] = cell[0]
+                    header_x_positions = [seen_cols.get(i, 0) for i in range(column_count)]
+                if not header_x_positions:
+                    header_x_positions = [
+                        (page_width / column_count) * i for i in range(column_count)
+                    ]
+
+                best_score = hdr_score
+                best_layout = {
+                    "header_texts": hdr_texts,
+                    "header_x_positions": header_x_positions,
+                    "column_count": column_count,
+                    "page_width": page_width,
+                    "page_height": page_height,
+                    "header_row_index": hdr_idx,
+                    "source": "pymupdf",
+                }
 
         doc.close()
-
-        return {
-            "header_texts": header_texts,
-            "header_x_positions": header_x_positions,
-            "column_count": column_count,
-            "page_width": page_width,
-            "page_height": page_height,
-            "header_row_index": header_row_idx,
-            "source": "pymupdf",
-        }
+        return best_layout
     except Exception as e:
         logger.debug("PyMuPDF layout extraction failed: %s", e)
         return None
 
 
 def _extract_layout_pdfplumber(pdf_path: str | Path) -> Optional[dict]:
-    """Extract layout info using pdfplumber."""
+    """Extract layout info using pdfplumber. Scans the first several pages and
+    picks the table whose header row scores highest — the transactions table
+    rather than a page-1 account summary."""
     import pdfplumber
 
     try:
@@ -239,58 +246,60 @@ def _extract_layout_pdfplumber(pdf_path: str | Path) -> Optional[dict]:
             if not pdf.pages:
                 return None
 
-            page = pdf.pages[0]
-            page_width = page.width
-            page_height = page.height
-
-            tables = page.extract_tables()
-            if not tables:
-                return None
-
-            # Use the largest table
-            table = max(tables, key=len)
-            if len(table) < 2:
-                return None
-
-            column_count = len(table[0])
-
-            # Prefer an actual header row, not the first non-empty data row.
-            header_texts = []
+            best_layout: dict | None = None
             best_score = -1
-            for idx in range(min(6, len(table))):
-                score, cleaned = _header_row_score(table[idx])
-                if score > best_score:
-                    best_score = score
-                    header_texts = cleaned
 
-            if not header_texts or not _is_layout_header_candidate(header_texts, min_roles=_MIN_ROLES_FOR_MATCH):
-                return None
-
-            # Get x-positions from words on the page
-            words = page.extract_words()
-            header_x_positions = []
-            for h_text in header_texts:
-                if not h_text:
-                    header_x_positions.append(0)
+            for page in pdf.pages[:5]:
+                tables = page.extract_tables()
+                if not tables:
                     continue
-                # Find the word that best matches this header
-                first_word = h_text.split()[0].lower() if h_text.split() else ""
-                matched_x = 0
-                for w in words:
-                    if w["text"].lower().startswith(first_word[:4]) if len(first_word) >= 4 else w["text"].lower() == first_word:
-                        matched_x = w["x0"]
-                        break
-                header_x_positions.append(matched_x)
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    column_count = len(table[0])
 
-            return {
-                "header_texts": header_texts,
-                "header_x_positions": header_x_positions,
-                "column_count": column_count,
-                "page_width": page_width,
-                "page_height": page_height,
-                "header_row_index": 0,
-                "source": "pdfplumber",
-            }
+                    hdr_texts: list[str] = []
+                    hdr_score = -1
+                    for idx in range(min(6, len(table))):
+                        score, cleaned = _header_row_score(table[idx])
+                        if score > hdr_score:
+                            hdr_score = score
+                            hdr_texts = cleaned
+                    if not hdr_texts or hdr_score <= best_score:
+                        continue
+                    if not _is_layout_header_candidate(hdr_texts, min_roles=_MIN_ROLES_FOR_MATCH):
+                        continue
+
+                    words = page.extract_words()
+                    header_x_positions = []
+                    for h_text in hdr_texts:
+                        if not h_text:
+                            header_x_positions.append(0)
+                            continue
+                        first_word = h_text.split()[0].lower() if h_text.split() else ""
+                        matched_x = 0
+                        for w in words:
+                            if (
+                                w["text"].lower().startswith(first_word[:4])
+                                if len(first_word) >= 4
+                                else w["text"].lower() == first_word
+                            ):
+                                matched_x = w["x0"]
+                                break
+                        header_x_positions.append(matched_x)
+
+                    best_score = hdr_score
+                    best_layout = {
+                        "header_texts": hdr_texts,
+                        "header_x_positions": header_x_positions,
+                        "column_count": column_count,
+                        "page_width": page.width,
+                        "page_height": page.height,
+                        "header_row_index": 0,
+                        "source": "pdfplumber",
+                    }
+
+            return best_layout
     except Exception as e:
         logger.debug("pdfplumber layout extraction failed: %s", e)
         return None
@@ -616,13 +625,23 @@ def save_extraction_template_detailed(
             "skipped": True,
             "reason": "no_layout_info",
         }
-    if not _is_layout_header_candidate(
-        layout.get("header_texts", []), min_roles=_MIN_ROLES_FOR_SAVE
-    ):
-        headers = layout.get("header_texts", [])
+    # Standard gate: require _MIN_ROLES_FOR_SAVE recognised header roles.
+    # Relaxed path: if at least 1 role was recognised AND we can auto-detect
+    # the bank name, the layout is still a valid identity marker because the
+    # bank-name string disambiguates it from other banks that happen to share
+    # a 1-role header (e.g. a generic "Balance" summary column).
+    headers = layout.get("header_texts", [])
+    detected_bank = detect_bank_name(pdf_path)
+    meets_full_gate = _is_layout_header_candidate(headers, min_roles=_MIN_ROLES_FOR_SAVE)
+    meets_relaxed = (
+        bool(detected_bank)
+        and _is_layout_header_candidate(headers, min_roles=1)
+    )
+    if not meets_full_gate and not meets_relaxed:
         logger.warning(
             "Skipping template save: headers did not meet save threshold "
-            "(need %d recognized roles @ confidence >= %.2f): %s",
+            "(need %d recognized roles @ confidence >= %.2f, or bank-name "
+            "fallback at >=1 role): %s",
             _MIN_ROLES_FOR_SAVE, _HEADER_ROLE_CONF_MIN, headers,
         )
         return {
@@ -631,6 +650,11 @@ def save_extraction_template_detailed(
             "reason": "headers_below_save_threshold",
             "headers": headers,
         }
+    if meets_relaxed and not meets_full_gate:
+        logger.info(
+            "Template save: low-role layout accepted via bank-name fallback (bank=%s)",
+            detected_bank,
+        )
 
     fingerprint = generate_fingerprint(
         layout["header_texts"],
@@ -645,8 +669,7 @@ def save_extraction_template_detailed(
                   "header_row_count", "unsigned_is_debit")
     }
 
-    # Auto-detect bank name from PDF content
-    bank_name = detect_bank_name(pdf_path)
+    bank_name = detected_bank
     if bank_name:
         logger.info("Auto-detected bank name: %s", bank_name)
 

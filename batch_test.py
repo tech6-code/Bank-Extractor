@@ -450,6 +450,21 @@ def main():
     results = []
     sep_line = "-" * 160
 
+    # Incremental CSV so partial results survive if the run is interrupted.
+    incremental_csv = ROOT / f"batch_test_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.partial.csv"
+    inc_fields = [
+        "file", "bank", "pages", "transactions", "strategy",
+        "template_status", "template_id",
+        "debits", "credits", "has_balance",
+        "total_debit", "total_credit",
+        "validated_rows", "accuracy_pct", "mismatches", "direction",
+        "time_sec", "error",
+    ]
+    inc_fh = open(incremental_csv, "w", newline="", encoding="utf-8")
+    inc_writer = csv.DictWriter(inc_fh, fieldnames=inc_fields, extrasaction="ignore")
+    inc_writer.writeheader()
+    inc_fh.flush()
+
     for i, pdf_path in enumerate(pdf_files, 1):
         # Brief live status before processing
         print(f"  ... [{i:3d}/{total}] {pdf_path.name[:60]}", end="\r", flush=True)
@@ -457,12 +472,18 @@ def main():
         r = test_pdf(str(pdf_path))
         results.append(r)
 
+        # Append to incremental CSV and flush
+        inc_writer.writerow(r)
+        inc_fh.flush()
+
         # Print the result row
         print(_row(i, r))
 
         # Every 10 files print a light separator for readability
         if i % 10 == 0 and i < total:
             print(sep_line[:80])
+
+    inc_fh.close()
 
     print("=" * 160)
 

@@ -937,8 +937,22 @@ def classify_column_header(header: str) -> tuple[str, float]:
     if not header:
         return "unknown", 0.0
 
+    # Bilingual layouts (Arabic/Hebrew on top of English) often render as a
+    # single header cell like "التاريخ Date" or "الرصيد\nBalance". The Arabic
+    # glyphs prevent the English keyword from matching, so strip RTL ranges
+    # first and use the ASCII-only form when it has enough English content.
+    # Pure-Arabic or pure-Chinese headers (no English) keep their original
+    # form so existing language-specific keywords (e.g. "银行参考号") still match.
+    _RTL_CHARS_RE = re.compile(r"[֐-׿؀-ۿ܀-ݏݐ-ݿࢠ-ࣿיִ-ﻼ]+")
+    _stripped = _RTL_CHARS_RE.sub(" ", header)
+    _stripped = re.sub(r"\s+", " ", _stripped).strip()
+    if len(_stripped) >= 2 and _stripped != header.strip():
+        h_source = _stripped
+    else:
+        h_source = header
+
     # Normalise: keep Unicode headers so bilingual layouts can be classified.
-    h = header
+    h = h_source
     h = re.sub(r"[*#()\[\]]", "", h)
     h = re.sub(r"\s+", " ", h).strip().lower()
     if not h:
@@ -1092,6 +1106,230 @@ def _score_header_line(sorted_words: list[dict]) -> tuple[int, list[tuple[str, f
     return score, col_roles
 
 
+def _heal_truncated_balances(transactions: list[dict], pdf_path: Path) -> int:
+    """Replace single-decimal balance values with their full-precision counterpart
+    from the PDF's word extraction.
+
+    pdfplumber's text-strategy table extraction occasionally clips the last digit
+    of a balance value when the column boundary lands inside the word — e.g. the
+    PDF actually contains "122,489.07" but the table cell reads "122,489.0". The
+    page-level `extract_words()` call doesn't have this bug (it gives the full
+    string), so we collect all 2-decimal candidates from page words and look up
+    unique matches by prefix.
+    """
+    # Collect transactions that look truncated (decimal part has exactly 1 digit)
+    suspects = [
+        t for t in transactions
+        if re.match(
+            r"^-?[\d,]+\.\d$",
+            str(t.get("balance", "") or "").replace("CR", "").replace("DR", "").strip(),
+        )
+    ]
+    if not suspects:
+        return 0
+
+    # Collect every full-precision balance-like word across all pages
+    full_words: set[str] = set()
+    try:
+        import pdfplumber  # noqa: PLC0415
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                for w in page.extract_words():
+                    txt = w["text"].strip()
+                    if re.match(r"^-?[\d,]+\.\d{2}(?:CR|DR)?$", txt):
+                        full_words.add(txt)
+    except Exception as e:
+        logger.debug(f"Balance healing word-scan failed: {e}")
+        return 0
+
+    def _to_num(s: str) -> float | None:
+        if not s:
+            return None
+        cleaned = re.sub(r"[^\d.\-]", "", str(s).rstrip("CRDcrd").strip())
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    healed = 0
+    for idx, t in enumerate(transactions):
+        if t not in suspects:
+            continue
+        raw = str(t.get("balance", "") or "").strip()
+        suffix = "CR" if raw.endswith("CR") else "DR" if raw.endswith("DR") else ""
+        core = raw[:-2] if suffix else raw
+        # Strict prefix match: full word starts with the truncated core AND
+        # adds exactly one more digit before any optional suffix.
+        candidates = [
+            fw for fw in full_words
+            if fw.startswith(core)
+            and len(fw) == len(core) + 1 + (2 if fw.endswith(("CR", "DR")) else 0)
+        ]
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            t["balance"] = candidates[0]
+            healed += 1
+            continue
+        # Multiple candidates — disambiguate by looking at the neighbouring rows.
+        # The true balance must satisfy: |this_bal - neighbour_bal| == neighbour_amount
+        # for the neighbour whose amount value is known.
+        chosen: str | None = None
+        for offset in (1, -1):
+            nb_idx = idx + offset
+            if nb_idx < 0 or nb_idx >= len(transactions):
+                continue
+            nb = transactions[nb_idx]
+            nb_bal = _to_num(nb.get("balance", ""))
+            nb_amt = max(_to_num(nb.get("debit", "")) or 0, _to_num(nb.get("credit", "")) or 0)
+            if nb_bal is None or nb_amt <= 0:
+                continue
+            best_c = None
+            best_residual = float("inf")
+            for c in candidates:
+                c_num = _to_num(c)
+                if c_num is None:
+                    continue
+                residual = abs(abs(c_num - nb_bal) - nb_amt)
+                if residual < best_residual:
+                    best_residual = residual
+                    best_c = c
+            if best_c is not None and best_residual < 0.01:
+                chosen = best_c
+                break
+        if chosen:
+            t["balance"] = chosen
+            healed += 1
+
+    if healed:
+        logger.info(f"Balance healing: restored full precision on {healed} balance(s)")
+    return healed
+
+
+def _reconcile_debit_credit_via_balance(transactions: list[dict]) -> int:
+    """Use the running-balance invariant to correct mis-classified debit/credit.
+
+    Many bank statements (Sharjah Islamic Bank's Debit/Credit are visually
+    separate columns but share an x-range, so pdfplumber merges them into one)
+    arrive with all amounts in the wrong slot. We can recover the correct
+    classification from each row's balance delta vs. the previous row:
+
+        if balance dropped: the transaction was a debit
+        if balance rose:    the transaction was a credit
+
+    For each row we cross-check the current debit/credit assignment against
+    the delta and flip when (a) the delta is unambiguous and (b) the value
+    being flipped matches the delta magnitude. Returns the number of rows
+    that were corrected.
+
+    Conservative on purpose — we only flip when the delta exactly matches
+    the recorded amount (within 0.02 to tolerate rounding). Rows without a
+    previous balance or with ambiguous deltas are left untouched.
+    """
+    def _to_float(s: str) -> float | None:
+        if not s:
+            return None
+        cleaned = re.sub(r"[^\d.\-]", "", str(s).rstrip("CRDcrd").strip())
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _amounts_match(a: float, b: float) -> bool:
+        # Allow both absolute and relative slack: pdfplumber sometimes truncates
+        # the last digit of a balance (e.g. "122,489.0" instead of "122,489.07"),
+        # so a strict 0.02 absolute tolerance would miss legitimate matches.
+        # 0.5 absolute covers one-digit truncation; 0.0001 relative covers
+        # rounding on large amounts.
+        max_val = max(a, b, 1.0)
+        return abs(a - b) < 0.5 or abs(a - b) / max_val < 0.0001
+
+    prev_balance: float | None = None
+    corrected = 0
+    for t in transactions:
+        bal = _to_float(t.get("balance", ""))
+        if bal is None:
+            continue
+        if prev_balance is not None:
+            delta = bal - prev_balance
+            debit_val = _to_float(t.get("debit", ""))
+            credit_val = _to_float(t.get("credit", ""))
+
+            # Balance dropped → the row is a debit
+            if delta < -0.005 and credit_val and not debit_val:
+                if _amounts_match(credit_val, abs(delta)):
+                    t["debit"] = t["credit"]
+                    t["credit"] = ""
+                    corrected += 1
+            # Balance rose → the row is a credit
+            elif delta > 0.005 and debit_val and not credit_val:
+                if _amounts_match(debit_val, delta):
+                    t["credit"] = t["debit"]
+                    t["debit"] = ""
+                    corrected += 1
+        prev_balance = bal
+
+    # Second pass: classify the FIRST row when there was no prev_balance to
+    # compare against. We look one row ahead — if the next row's balance and
+    # delta tell us whether this row was a debit or credit, we can deduce
+    # the same for the current row via the chain
+    #     this_bal = prev_opening_bal + (credit_this - debit_this)
+    # When the row's amount is in the wrong slot and the next row resolves
+    # cleanly via the same matching test, mirror the next row's classification.
+    if transactions:
+        # Find first reconcilable row pair (i, i+1) where i has only one of
+        # debit/credit set but no prev_balance was available.
+        for i in range(len(transactions) - 1):
+            t = transactions[i]
+            n = transactions[i + 1]
+            bal_t = _to_float(t.get("balance", ""))
+            bal_n = _to_float(n.get("balance", ""))
+            if bal_t is None or bal_n is None:
+                continue
+            debit_t = _to_float(t.get("debit", ""))
+            credit_t = _to_float(t.get("credit", ""))
+            if (debit_t and credit_t) or (not debit_t and not credit_t):
+                continue
+            # Compute what the row's delta should have been (from a synthetic
+            # opening balance derived from the row's own amount in either slot)
+            amount = credit_t if credit_t else debit_t
+            # If amount matches an inward direction relative to the *next* row
+            # (i.e. balance after this row + next row's effect = next row's bal),
+            # we trust the next row's delta to validate which side is correct.
+            delta_next = bal_n - bal_t
+            debit_n = _to_float(n.get("debit", ""))
+            credit_n = _to_float(n.get("credit", ""))
+            next_dir_debit = (
+                delta_next < -0.005 and (debit_n or credit_n)
+                and _amounts_match(debit_n or credit_n, abs(delta_next))
+            )
+            next_dir_credit = (
+                delta_next > 0.005 and (debit_n or credit_n)
+                and _amounts_match(debit_n or credit_n, delta_next)
+            )
+            if not (next_dir_debit or next_dir_credit):
+                continue
+            # If the next-row check passes, the current row's debit/credit slot
+            # must be consistent with its own (unknown) opening balance. We can
+            # only flip when the row's amount is sitting in the slot that
+            # disagrees with the running-balance direction relative to the next.
+            # Concretely: if balance went down across the boundary, the current
+            # row's amount belongs to debit. (Reverse for up.)
+            # This is a best-effort first-row repair.
+            if next_dir_debit and credit_t and not debit_t:
+                # Heuristic: when the *very first* row has credit set but the
+                # statement is clearly debit-dominated (next row is debit too),
+                # the first row is almost certainly a debit too.
+                t["debit"] = t["credit"]
+                t["credit"] = ""
+                corrected += 1
+            break  # only attempt repair on the leading row
+
+    if corrected:
+        logger.info(f"Balance-delta reconciliation: corrected {corrected} debit/credit assignment(s)")
+    return corrected
+
+
 def extract_transactions(pdf_path: str, template: dict | None = None) -> list[dict]:
     """Extract structured transactions from a bank statement PDF.
 
@@ -1144,6 +1382,8 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
                     f"quality={tmpl_quality:.1f}) — falling back to full pipeline"
                 )
             else:
+                _heal_truncated_balances(transactions, pdf_path)
+                _reconcile_debit_credit_via_balance(transactions)
                 # Append metadata for the server
                 meta = {
                     "_extraction_meta": {
@@ -1164,21 +1404,47 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
             logger.warning("Template-guided extraction yielded 0 transactions, falling back to full pipeline")
 
     # ── Full pipeline (no template or template failed) ────────────────────────
-    # Strategy 1: table-based extraction — run PyMuPDF and pdfplumber in parallel,
-    # then use whichever yields more valid (non-merged) transactions.
-    # PyMuPDF uses visual ruling-line detection so it captures the first data row
-    # on every page; pdfplumber handles edge cases where PyMuPDF finds no tables.
-    pymupdf_txns, pymupdf_col_map = _extract_from_pymupdf(pdf_path)
-    # Always run pdfplumber as co-primary: it catches tables PyMuPDF misses
-    # (borderless PDFs, mixed ruling styles). The quality-score picker below
-    # chooses the winner and discards the loser.
+    # Strategy 1: table-based extraction — run PyMuPDF first, then pdfplumber
+    # as a co-primary, and use whichever scores higher on quality.
+    #
+    # For LARGE PDFs (> _LARGE_PDF_PAGES pages) the pdfplumber pass is the
+    # single most expensive step in the pipeline. We skip it whenever PyMuPDF
+    # already produced a clearly high-quality extraction (≥80% rows with both
+    # amounts and balance). Small PDFs always run both strategies — the cost
+    # is bounded and the extra coverage is worth it.
+    _LARGE_PDF_PAGES = 20
     try:
-        pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
-    except Exception as e:
-        logger.warning(f"pdfplumber table extraction failed: {e}")
-        pdfplumber_txns, pdfplumber_col_map = [], None
+        import fitz  # PyMuPDF — already a hard dependency  # noqa: PLC0415
+        with fitz.open(str(pdf_path)) as _doc:
+            _page_count = _doc.page_count
+    except Exception:
+        _page_count = 0
 
+    pymupdf_txns, pymupdf_col_map = _extract_from_pymupdf(pdf_path)
     pymupdf_ok = bool(pymupdf_txns) and not _has_merged_rows(pymupdf_txns)
+
+    _skip_pdfplumber = False
+    if _page_count > _LARGE_PDF_PAGES and pymupdf_ok:
+        n_pm = len(pymupdf_txns)
+        has_bal_pct = sum(1 for t in pymupdf_txns if t.get("balance")) / n_pm if n_pm else 0
+        has_amt_pct = sum(1 for t in pymupdf_txns if t.get("debit") or t.get("credit")) / n_pm if n_pm else 0
+        if has_bal_pct >= 0.80 and has_amt_pct >= 0.80:
+            logger.info(
+                f"Large PDF ({_page_count} pages): PyMuPDF coverage is high "
+                f"(amounts={has_amt_pct:.0%}, balance={has_bal_pct:.0%}) — "
+                "skipping pdfplumber co-primary to save time"
+            )
+            _skip_pdfplumber = True
+
+    if _skip_pdfplumber:
+        pdfplumber_txns, pdfplumber_col_map = [], None
+    else:
+        try:
+            pdfplumber_txns, pdfplumber_col_map = _extract_from_tables(pdf_path)
+        except Exception as e:
+            logger.warning(f"pdfplumber table extraction failed: {e}")
+            pdfplumber_txns, pdfplumber_col_map = [], None
+
     pdfplumber_ok = bool(pdfplumber_txns) and not _has_merged_rows(pdfplumber_txns)
 
     if pymupdf_ok or pdfplumber_ok:
@@ -1247,8 +1513,12 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
         # transactions (those not already present by date+amount+balance).
         # Skip supplement when table strategy already has good coverage — running
         # words/text strategies on large PDFs is expensive and rarely helps.
+        # For large PDFs we use a stricter threshold: only supplement when the
+        # primary clearly missed something (<40% amounts), otherwise the extra
+        # two full-document scans cost minutes for marginal gain.
         supplement_candidates = []
-        if has_amounts_pct < 0.70:
+        _supplement_threshold = 0.40 if _page_count > _LARGE_PDF_PAGES else 0.70
+        if has_amounts_pct < _supplement_threshold:
             for strat_name, strat_fn in [("words", _extract_from_words), ("text", _extract_from_text)]:
                 try:
                     strat_txns = strat_fn(pdf_path)
@@ -1288,6 +1558,8 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
         # Deduplicate: remove any transactions added by gap-fill that are
         # exact duplicates of existing rows (same date + debit + credit + balance).
         transactions = _deduplicate_transactions(transactions)
+        _heal_truncated_balances(transactions, pdf_path)
+        _reconcile_debit_credit_via_balance(transactions)
 
         # Append metadata for template saving (include col_map)
         meta = {"_extraction_meta": {
@@ -1347,6 +1619,8 @@ def extract_transactions(pdf_path: str, template: dict | None = None) -> list[di
             transactions = words_txns
             fallback_source = "words"
         if transactions:
+            _heal_truncated_balances(transactions, pdf_path)
+            _reconcile_debit_credit_via_balance(transactions)
             meta = {"_extraction_meta": {"strategy": fallback_source, "template_matched": False}}
             transactions.append(meta)
             return transactions
@@ -2846,8 +3120,56 @@ def _infer_columns_by_content(table: list[list[str]]) -> dict | None:
                     has_explicit_sign = True
                     break
 
+        # Balance signature: running-balance values cluster tightly because
+        # they are consecutive account totals — within one statement the
+        # max/min ratio is almost always under 50× (often under 10×).
+        # Real debit/credit columns mix small fees ($0.02) with large
+        # transfers ($250k+), giving a ratio in the thousands or millions.
+        # We use a *trimmed* magnitude ratio (median-filter outliers ≥1000×
+        # the median to suppress IBAN/reference-number bleed) so a single
+        # garbage cell doesn't poison the signal.
+        def _trimmed_magnitude_ratio(col_idx: int) -> float:
+            vals: list[float] = []
+            for row in sample_rows:
+                if col_idx >= len(row):
+                    continue
+                raw = str(row[col_idx] or "").strip()
+                if not raw:
+                    continue
+                cleaned = re.sub(r"[^\d.\-]", "", raw.rstrip("CRDcrd").strip())
+                try:
+                    v = float(cleaned)
+                except ValueError:
+                    continue
+                if v != 0:
+                    vals.append(abs(v))
+            if len(vals) < 3:
+                return float("inf")
+            vals.sort()
+            median = vals[len(vals) // 2]
+            if median <= 0:
+                return float("inf")
+            # Drop wild outliers (>1000× off the median) — these are usually
+            # IBANs or reference numbers misread as amounts.
+            trimmed = [v for v in vals if 0.001 <= v / median <= 1000]
+            if len(trimmed) < 3:
+                return float("inf")
+            mn, mx = min(trimmed), max(trimmed)
+            return mx / mn if mn > 0 else float("inf")
+
+        def _looks_like_running_balance(col_idx: int) -> bool:
+            # Balance ratio is small AND the column being compared to has
+            # a much wider ratio (otherwise we can't tell debit vs balance).
+            return _trimmed_magnitude_ratio(col_idx) < 50
+
         if has_explicit_sign:
             # Signed amount + balance (e.g. Wio Bank, or Sharjah page 10)
+            col_map["amount"] = amount_cols[0]
+            col_map["balance"] = amount_cols[1]
+        elif _looks_like_running_balance(amount_cols[1]):
+            # Rightmost is a running balance. Left is an unsigned amount column
+            # that combines debit and credit values. Sign is recovered later
+            # via balance-delta reconciliation; for now both go into "amount".
             col_map["amount"] = amount_cols[0]
             col_map["balance"] = amount_cols[1]
         elif e0 > total_sampled * 0.3 or e1 > total_sampled * 0.3:

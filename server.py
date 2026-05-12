@@ -53,11 +53,16 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 FILE_TTL_SECONDS = 3600  # 1 hour
 CACHE_MAX_ENTRIES = int(os.getenv("CACHE_MAX_ENTRIES", "50"))
+# Soft cap on the cumulative approximate byte size of cached extractions.
+# Each entry's size is estimated cheaply (row count × per-row constant); when
+# the total exceeds this we evict LRU entries until under cap.
+CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(256 * 1024 * 1024)))  # 256 MB
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
 # Max seconds a single extraction can run before the request is failed with 504.
-# Prevents a runaway PDF from holding a worker indefinitely.
-EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "300"))
+# Prevents a runaway PDF from holding a worker indefinitely. Default 10 min —
+# enough for very large PDFs while still bounded; override in production via env.
+EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("EXTRACTION_TIMEOUT_SECONDS", "600"))
 
 
 def _purge_stale_files() -> None:
@@ -73,9 +78,11 @@ def _purge_stale_files() -> None:
 
 def _cleanup_after_download(file_id: str) -> None:
     """Delete the PDF and XLSX for a file_id and evict from cache."""
+    global _cache_total_bytes
     for suffix in (".pdf", "_unlocked.pdf", ".xlsx"):
         (TEMP_DIR / f"{file_id}{suffix}").unlink(missing_ok=True)
-    _cache.pop(file_id, None)
+    if _cache.pop(file_id, None) is not None:
+        _cache_total_bytes -= _cache_sizes.pop(file_id, 0)
 
 
 @asynccontextmanager
@@ -96,16 +103,37 @@ app.add_middleware(
 
 COLUMNS = ["Date", "Description", "Debit", "Credit", "Balance"]
 
-# In-memory LRU cache: file_id -> extracted transactions (evicts oldest when full)
+# In-memory LRU cache: file_id -> extracted transactions.
+# Evicts oldest entries when either the entry count exceeds CACHE_MAX_ENTRIES
+# or the approximate cumulative byte size exceeds CACHE_MAX_BYTES.
 _cache: OrderedDict[str, list[dict]] = OrderedDict()
+_cache_sizes: dict[str, int] = {}
+_cache_total_bytes = 0
+# Rough per-row memory estimate: 5 string fields × ~80 chars average + dict
+# overhead. Cheap to compute and good enough for cache pressure decisions.
+_PER_ROW_BYTES = 500
+
+
+def _estimate_cache_entry_size(transactions: list[dict]) -> int:
+    return max(len(transactions), 1) * _PER_ROW_BYTES
 
 
 def _cache_put(file_id: str, transactions: list[dict]) -> None:
-    """Add entry to cache, evicting oldest if over limit."""
+    """Add entry to cache, evicting oldest if over the count or byte limit."""
+    global _cache_total_bytes
+    # If replacing an existing entry, subtract its previous size first.
+    if file_id in _cache_sizes:
+        _cache_total_bytes -= _cache_sizes.pop(file_id)
+    entry_size = _estimate_cache_entry_size(transactions)
     _cache[file_id] = transactions
     _cache.move_to_end(file_id)
-    while len(_cache) > CACHE_MAX_ENTRIES:
-        evicted_id, _ = _cache.popitem(last=False)
+    _cache_sizes[file_id] = entry_size
+    _cache_total_bytes += entry_size
+    while _cache and (
+        len(_cache) > CACHE_MAX_ENTRIES or _cache_total_bytes > CACHE_MAX_BYTES
+    ):
+        evicted_id, _evicted_txns = _cache.popitem(last=False)
+        _cache_total_bytes -= _cache_sizes.pop(evicted_id, 0)
         logger.debug("Cache evicted: %s", evicted_id)
 
 
@@ -182,16 +210,38 @@ async def extract_preview(file: UploadFile, password: str | None = Form(default=
 
     file_id = uuid.uuid4().hex
     pdf_path = TEMP_DIR / f"{file_id}.pdf"
-
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)} MB.")
     TEMP_DIR.mkdir(exist_ok=True)
-    pdf_path.write_bytes(content)
+
+    # Stream the upload to disk in chunks. We never hold the entire payload in
+    # memory and we abort as soon as the running total exceeds MAX_FILE_SIZE,
+    # so an oversized upload cannot OOM the worker on the way in.
+    total_bytes = 0
+    chunk_size = 1024 * 1024  # 1 MB
+    try:
+        with pdf_path.open("wb") as out:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_FILE_SIZE:
+                    out.close()
+                    pdf_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        413,
+                        f"File too large. Maximum allowed size is {MAX_FILE_SIZE // (1024 * 1024)} MB.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(500, f"Failed to receive upload: {e}")
+
     working_pdf_path = pdf_path
 
     try:
-        logger.info(f"Extracting transactions from {file.filename} ({len(content)} bytes)")
+        logger.info(f"Extracting transactions from {file.filename} ({total_bytes} bytes)")
         working_pdf_path = _prepare_working_pdf(pdf_path, password, file_id)
 
         # ── Template matching ─────────────────────────────────────────────
